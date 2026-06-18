@@ -29,6 +29,7 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
+from .rl_kernel import maybe_compute_logp
 
 
 def get_responses(
@@ -431,14 +432,18 @@ def get_log_probs_and_entropy(
         T, device, unconcat_tokens, total_lengths, response_lengths, qkv_format, max_seq_lens, args.allgather_cp
     )
 
-    # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
-    log_prob_full, entropy_full = calculate_log_probs_and_entropy(
-        logits,
-        full_tokens,
-        tp_group,
-        with_entropy=with_entropy,
-        chunk_size=chunk_size,
-    )
+    # --- compute on full [T,V] logits at once ---
+    log_prob_full = maybe_compute_logp(logits, full_tokens, args=args, with_entropy=with_entropy)
+    if log_prob_full is None:
+        log_prob_full, entropy_full = calculate_log_probs_and_entropy(
+            logits,
+            full_tokens,
+            tp_group,
+            with_entropy=with_entropy,
+            chunk_size=chunk_size,
+        )
+    else:
+        entropy_full = None
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
     # --- extract per-sample response portions ---

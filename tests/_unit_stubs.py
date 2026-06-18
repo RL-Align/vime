@@ -223,4 +223,5 @@ def install_triton_stub() -> None:
 def install_vime_distributed_utils_stub() -> None:
     vime_utils = types.ModuleType("vime.utils.distributed_utils")
     vime_utils.get_gloo_group = MagicMock(return_value="gloo")
+    vime_utils.distributed_masked_whiten = MagicMock(side_effect=lambda values, *args, **kwargs: values)
     sys.modules.setdefault("vime.utils.distributed_utils", vime_utils)
