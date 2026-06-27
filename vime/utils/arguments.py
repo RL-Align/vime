@@ -12,6 +12,7 @@ from vime.backends.vllm_utils.arguments import validate_args as vllm_validate_ar
 from vime.backends.vllm_utils.arguments import vllm_parse_args
 from vime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from vime.utils.logging_utils import configure_logger
+from vime.utils.rl_kernel import normalize_rl_kernel_args
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,24 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
+            )
+            parser.add_argument(
+                "--enable-rl-kernel",
+                action="store_true",
+                default=False,
+                help="Enable optional RL-Kernel acceleration for supported vime training/forward-only paths.",
+            )
+            parser.add_argument(
+                "--rl-kernel-ops",
+                type=str,
+                default="linear_logp",
+                help="Comma-separated RL-Kernel ops to enable. Current production integration supports: linear_logp.",
+            )
+            parser.add_argument(
+                "--rl-kernel-strict",
+                action="store_true",
+                default=False,
+                help="Raise instead of falling back when an enabled RL-Kernel op is unavailable or unsupported.",
             )
             parser.add_argument(
                 "--only-train-params-name-list",
@@ -1606,6 +1625,8 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def vime_validate_args(args):
+    normalize_rl_kernel_args(args)
+
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.kl_coef != 0 or args.use_kl_loss:
@@ -1849,6 +1870,17 @@ def vime_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+            # vllm launch_server_process distinguishes "user-supplied value" from
+            # "argparse default" via ``args._vllm_user_provided``. YAML overrides
+            # bypass argparse, so we register them explicitly here — without this,
+            # YAML values that happen to equal the vllm-side default (e.g.
+            # ``vllm_gpu_memory_utilization: 0.92``) would be treated as "default"
+            # and silently replaced by vime's preferred value.
+            if isinstance(k, str) and k.startswith("vllm_"):
+                if not hasattr(args, "_vllm_user_provided"):
+                    args._vllm_user_provided = set()
+                args._vllm_user_provided.add(k)
+        normalize_rl_kernel_args(args)
 
     if args.eval_max_context_len is None:
         logger.info(

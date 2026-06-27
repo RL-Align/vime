@@ -57,7 +57,8 @@ def install_rollout_optional_stubs() -> None:
     """Stub rollout-side optional imports when not installed."""
     ensure_ray_stub()
 
-    install_vllm_router_stub()
+    if not real_module_available("vllm_router"):
+        sys.modules["vllm_router"] = types.ModuleType("vllm_router")
 
     if not real_module_available("PIL"):
         pil = types.ModuleType("PIL")
@@ -95,48 +96,6 @@ def install_rollout_optional_stubs() -> None:
         pylatexenc.latex2text = latex2text
         sys.modules["pylatexenc"] = pylatexenc
         sys.modules["pylatexenc.latex2text"] = latex2text
-
-    install_wandb_stub()
-
-
-def install_vllm_router_stub() -> None:
-    if real_module_available("vllm_router"):
-        return
-
-    class RouterArgs:
-        @classmethod
-        def add_cli_args(cls, parser, *args, **kwargs):  # noqa: ARG003
-            return parser
-
-        @classmethod
-        def from_cli_args(cls, args, *unused_args, **unused_kwargs):  # noqa: ARG003
-            return types.SimpleNamespace()
-
-    router_mod = types.ModuleType("vllm_router")
-    router_mod.__path__ = []
-    launch_router_mod = types.ModuleType("vllm_router.launch_router")
-    router_args_mod = types.ModuleType("vllm_router.router_args")
-    launch_router_mod.RouterArgs = RouterArgs
-    router_args_mod.RouterArgs = RouterArgs
-    router_mod.launch_router = launch_router_mod
-    router_mod.router_args = router_args_mod
-    sys.modules["vllm_router"] = router_mod
-    sys.modules["vllm_router.launch_router"] = launch_router_mod
-    sys.modules["vllm_router.router_args"] = router_args_mod
-
-
-def install_wandb_stub() -> None:
-    if real_module_available("wandb"):
-        return
-    wandb_mod = types.ModuleType("wandb")
-    wandb_mod.run = None
-    wandb_mod.log = MagicMock()
-    wandb_mod.finish = MagicMock()
-    wandb_mod.login = MagicMock()
-    wandb_mod.init = MagicMock()
-    wandb_mod.Settings = MagicMock()
-    wandb_mod.util = types.SimpleNamespace(generate_id=lambda: "unit-test")
-    sys.modules["wandb"] = wandb_mod
 
 
 def save_sys_modules(names: Iterable[str]) -> dict[str, Any]:
@@ -237,57 +196,14 @@ def install_vllm_cli_stubs() -> None:
 
     arg_utils.AsyncEngineArgs = AsyncEngineArgs
     engine_mod.arg_utils = arg_utils
-    system_utils_mod = types.ModuleType("vllm.utils.system_utils")
-    system_utils_mod.kill_process_tree = lambda pid, include_parent=True: None  # noqa: ARG005
-    utils_mod.system_utils = system_utils_mod
-
-    # vllm.entrypoints stubs (used by arguments.add_vllm_arguments and vllm_engine._vllm_server_field_names)
-    entrypoints_mod = types.ModuleType("vllm.entrypoints")
-    entrypoints_mod.__path__ = []
-    openai_mod = types.ModuleType("vllm.entrypoints.openai")
-    openai_mod.__path__ = []
-    cli_args_mod = types.ModuleType("vllm.entrypoints.openai.cli_args")
-
-    import dataclasses as _dc
-
-    @_dc.dataclass
-    class FrontendArgs:
-        @classmethod
-        def add_cli_args(cls, parser):  # noqa: ARG003
-            return parser
-
-    cli_args_mod.FrontendArgs = FrontendArgs
-    cli_args_mod.make_arg_parser = lambda parser=None: parser
-    cli_args_mod.validate_parsed_serve_args = lambda args: args
-    openai_mod.cli_args = cli_args_mod
-    entrypoints_mod.openai = openai_mod
-    vllm_mod.entrypoints = entrypoints_mod
-
-    cli_mod = types.ModuleType("vllm.entrypoints.cli")
-    cli_mod.__path__ = []
-    serve_mod = types.ModuleType("vllm.entrypoints.cli.serve")
-
-    class ServeSubcommand:
-        pass
-
-    serve_mod.ServeSubcommand = ServeSubcommand
-    cli_mod.serve = serve_mod
-    entrypoints_mod.cli = cli_mod
-
     vllm_mod.engine = engine_mod
     vllm_mod.utils = utils_mod
 
     sys.modules["vllm"] = vllm_mod
     sys.modules["vllm.utils"] = utils_mod
     sys.modules["vllm.utils.argparse_utils"] = argparse_utils
-    sys.modules["vllm.utils.system_utils"] = system_utils_mod
     sys.modules["vllm.engine"] = engine_mod
     sys.modules["vllm.engine.arg_utils"] = arg_utils
-    sys.modules["vllm.entrypoints"] = entrypoints_mod
-    sys.modules["vllm.entrypoints.openai"] = openai_mod
-    sys.modules["vllm.entrypoints.openai.cli_args"] = cli_args_mod
-    sys.modules["vllm.entrypoints.cli"] = cli_mod
-    sys.modules["vllm.entrypoints.cli.serve"] = serve_mod
 
 
 def install_triton_stub() -> None:
@@ -307,4 +223,5 @@ def install_triton_stub() -> None:
 def install_vime_distributed_utils_stub() -> None:
     vime_utils = types.ModuleType("vime.utils.distributed_utils")
     vime_utils.get_gloo_group = MagicMock(return_value="gloo")
+    vime_utils.distributed_masked_whiten = MagicMock(side_effect=lambda values, *args, **kwargs: values)
     sys.modules.setdefault("vime.utils.distributed_utils", vime_utils)
