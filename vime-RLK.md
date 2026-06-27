@@ -53,7 +53,7 @@ scripts/run-qwen3-30B-A3B.sh
 
 ```text
 NUM_GPUS=8
-MEGATRON_TP=4
+MEGATRON_TP=8
 MEGATRON_EP=8
 MEGATRON_CP=1
 ROLLOUT_NUM_GPUS_PER_ENGINE=8
@@ -187,7 +187,7 @@ PYTHONPATH=/root/Megatron-LM torchrun --nproc-per-node 8 \
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export NUM_GPUS=8
-export MEGATRON_TP=4
+export MEGATRON_TP=8
 export MEGATRON_EP=8
 export MEGATRON_CP=1
 export ROLLOUT_NUM_GPUS_PER_ENGINE=8

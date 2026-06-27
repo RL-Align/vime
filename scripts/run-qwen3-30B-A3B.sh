@@ -46,7 +46,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 VIME_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/models/qwen3-30B-A3B.sh"
 
-MEGATRON_TP=${MEGATRON_TP:-4}
+MEGATRON_TP=${MEGATRON_TP:-8}
 MEGATRON_EP=${MEGATRON_EP:-${NUM_GPUS}}
 MEGATRON_CP=${MEGATRON_CP:-1}
 MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-20480}
@@ -57,15 +57,20 @@ ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-8192}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
 ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-${NUM_GPUS}}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.7}
+VIME_CKPT_DIR=${VIME_CKPT_DIR:-/root/Qwen3-30B-A3B_vime}
 
 CKPT_ARGS=(
    --hf-checkpoint /root/Qwen3-30B-A3B
    #--hf-checkpoint /root/Qwen3-30B-A3B-FP8
    --ref-load /root/Qwen3-30B-A3B_torch_dist
-   --load /root/Qwen3-30B-A3B_vime/
-   --save /root/Qwen3-30B-A3B_vime/
-   --save-interval 20
+   --load "${VIME_CKPT_DIR}/"
 )
+if [[ "${VIME_DISABLE_SAVE:-0}" != "1" ]]; then
+   CKPT_ARGS+=(
+      --save "${VIME_CKPT_DIR}/"
+      --save-interval "${VIME_SAVE_INTERVAL:-20}"
+   )
+fi
 
 ROLLOUT_ARGS=(
    --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
@@ -91,6 +96,9 @@ EVAL_ARGS=(
    --eval-max-response-len 16384
    --eval-top-p 1
 )
+if [[ "${VIME_SKIP_EVAL_BEFORE_TRAIN:-0}" == "1" ]]; then
+   EVAL_ARGS+=(--skip-eval-before-train)
+fi
 
 PERF_ARGS=(
    --tensor-model-parallel-size "${MEGATRON_TP}"
@@ -108,6 +116,9 @@ PERF_ARGS=(
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
+if [[ "${VIME_NO_GRAD_ACCUM_FUSION:-0}" == "1" ]]; then
+   PERF_ARGS+=(--no-gradient-accumulation-fusion)
+fi
 
 GRPO_ARGS=(
    --advantage-estimator grpo
@@ -139,12 +150,24 @@ WANDB_ARGS=(
    # --wandb-key ${WANDB_KEY}
 )
 
+TB_ARGS=()
+if [[ "${VIME_TENSORBOARD:-0}" == "1" ]]; then
+   export TENSORBOARD_DIR="${TENSORBOARD_DIR:-${VIME_ROOT}/tensorboard_log/${TB_EXPERIMENT_NAME:-qwen3-30B-A3B}}"
+   TB_ARGS+=(--use-tensorboard)
+   TB_ARGS+=(--tb-project-name "${TB_PROJECT_NAME:-vime-rlk}")
+   TB_ARGS+=(--tb-experiment-name "${TB_EXPERIMENT_NAME:-qwen3-30B-A3B}")
+fi
+
 VLLM_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
    --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}"
    --vllm-enable-expert-parallel
-   --vllm-cudagraph-capture-sizes 1 2 4 8 $(seq 16 8 256)
 )
+if [[ "${VIME_VLLM_ENFORCE_EAGER:-0}" == "1" ]]; then
+   VLLM_ARGS+=(--vllm-enforce-eager)
+else
+   VLLM_ARGS+=(--vllm-cudagraph-capture-sizes 1 2 4 8 $(seq 16 8 256))
+fi
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1
@@ -173,8 +196,14 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disab
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"${VIME_ROOT}:/root/Megatron-LM/\",
+    \"PATH\": \"${PATH}\",
+    \"CUDA_HOME\": \"${CUDA_HOME:-}\",
+    \"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH:-}\",
+    \"CPATH\": \"${CPATH:-}\",
+    \"LIBRARY_PATH\": \"${LIBRARY_PATH:-}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"TENSORBOARD_DIR\": \"${TENSORBOARD_DIR:-}\"
   }
 }"
 
@@ -190,6 +219,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
    ${WANDB_ARGS[@]} \
+   ${TB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${VLLM_ARGS[@]} \

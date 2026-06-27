@@ -110,6 +110,10 @@ def _is_pipeline_last_stage_for_model(model) -> bool:
 
 
 def _get_lm_head_weight(model, output_layer) -> torch.Tensor | None:
+    weight = getattr(output_layer, "weight", None)
+    if isinstance(weight, torch.Tensor):
+        return weight
+
     shared_weight = getattr(model, "shared_embedding_or_output_weight", None)
     if callable(shared_weight):
         try:
@@ -119,8 +123,7 @@ def _get_lm_head_weight(model, output_layer) -> torch.Tensor | None:
         except Exception:
             logger.debug("Unable to read shared embedding/output weight for RL-Kernel linear_logp.", exc_info=True)
 
-    weight = getattr(output_layer, "weight", None)
-    return weight if isinstance(weight, torch.Tensor) else None
+    return None
 
 
 def get_linear_logp_context_from_model(args: Namespace, model) -> LinearLogpContext | None:

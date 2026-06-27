@@ -329,6 +329,51 @@ def test_linear_logp_context_from_model_uses_tp_vocab_offsets():
 
 
 @pytest.mark.unit
+def test_linear_logp_context_prefers_output_layer_weight_for_untied_pp1_model():
+    mpu.get_tensor_model_parallel_world_size.return_value = 1
+    mpu.get_tensor_model_parallel_rank.return_value = 0
+    mpu.get_tensor_model_parallel_group.return_value = None
+
+    output_weight = torch.empty(8, 4)
+    embedding_weight = torch.empty(8, 4)
+    output_layer = types.SimpleNamespace(weight=output_weight, bias=None)
+    model = types.SimpleNamespace(
+        output_layer=output_layer,
+        post_process=True,
+        pre_process=True,
+        shared_embedding_or_output_weight=lambda: embedding_weight,
+    )
+    args = _make_args()
+
+    context = rlk_mod.get_linear_logp_context_from_model(args, model)
+
+    assert context is not None
+    assert context.lm_head_weight is output_weight
+
+
+@pytest.mark.unit
+def test_linear_logp_context_uses_shared_weight_when_output_layer_weight_is_missing():
+    mpu.get_tensor_model_parallel_world_size.return_value = 1
+    mpu.get_tensor_model_parallel_rank.return_value = 0
+    mpu.get_tensor_model_parallel_group.return_value = None
+
+    embedding_weight = torch.empty(8, 4)
+    output_layer = types.SimpleNamespace(weight=None, bias=None)
+    model = types.SimpleNamespace(
+        output_layer=output_layer,
+        post_process=True,
+        pre_process=True,
+        shared_embedding_or_output_weight=lambda: embedding_weight,
+    )
+    args = _make_args()
+
+    context = rlk_mod.get_linear_logp_context_from_model(args, model)
+
+    assert context is not None
+    assert context.lm_head_weight is embedding_weight
+
+
+@pytest.mark.unit
 def test_linear_logp_context_uses_covered_padded_vocab_when_padded_vocab_size_missing():
     mpu.get_tensor_model_parallel_world_size.return_value = 4
     mpu.get_tensor_model_parallel_rank.return_value = 1
