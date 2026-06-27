@@ -27,14 +27,22 @@ try:
     from megatron.core.pipeline_parallel.utils import unwrap_model
 except ImportError:
     from megatron.core.utils import unwrap_model
+
 from vime.utils import logging_utils
 from vime.utils.memory_utils import clear_memory
+from vime.utils.rl_kernel import is_rl_kernel_op_enabled
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
-from .loss import loss_function
+from .loss import get_log_probs_and_entropy, loss_function
 from .model_provider import get_model_provider_func
+from .rl_kernel import (
+    get_linear_logp_context_from_model,
+    return_hidden_states_for_linear_logp,
+    should_use_linear_logp_model_output,
+    warn_linear_logp_fallback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +79,35 @@ def _wrap_forward_step_with_microbatch_pbar(forward_step_func, pbar):
         return result
 
     return wrapped_forward_step
+
+
+def _forward_only_should_return_hidden_for_linear_logp(
+    f: Callable[..., dict[str, list[torch.Tensor]]],
+    args: Namespace,
+) -> bool:
+    return f is get_log_probs_and_entropy and should_use_linear_logp_model_output(
+        args,
+        with_entropy=args.use_rollout_entropy,
+    )
+
+
+def _train_should_return_hidden_for_linear_logp(args: Namespace, *, return_schedule_plan: bool) -> bool:
+    if not is_rl_kernel_op_enabled(args, "linear_logp"):
+        return False
+
+    if args.loss_type not in {"policy_loss", "sft_loss"}:
+        return False
+
+    if return_schedule_plan:
+        warn_linear_logp_fallback(args, "schedule-plan forward path is not supported")
+        return False
+
+    if getattr(args, "enable_mtp_training", False):
+        warn_linear_logp_fallback(args, "MTP training path is not supported")
+        return False
+
+    with_entropy = args.loss_type == "policy_loss" and getattr(args, "entropy_coef", 0.0) != 0
+    return should_use_linear_logp_model_output(args, with_entropy=with_entropy)
 
 
 def _iter_critic_output_layers(model: Sequence[DDP]):
@@ -342,17 +379,25 @@ def forward_only(
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
-        output_tensor = model(**forward_kwargs)
+        linear_logp_context = None
+        if _forward_only_should_return_hidden_for_linear_logp(f, args):
+            linear_logp_context = get_linear_logp_context_from_model(args, model)
 
-        return output_tensor, partial(
-            f,
-            args=args,
-            unconcat_tokens=unconcat_tokens,
-            total_lengths=total_lengths,
-            response_lengths=response_lengths,
-            with_entropy=args.use_rollout_entropy,
-            max_seq_lens=batch.get("max_seq_lens", None),
-        )
+        with return_hidden_states_for_linear_logp(args, model, linear_logp_context):
+            output_tensor = model(**forward_kwargs)
+
+        callback_kwargs = {
+            "args": args,
+            "unconcat_tokens": unconcat_tokens,
+            "total_lengths": total_lengths,
+            "response_lengths": response_lengths,
+            "with_entropy": args.use_rollout_entropy,
+            "max_seq_lens": batch.get("max_seq_lens", None),
+        }
+        if f is get_log_probs_and_entropy:
+            callback_kwargs["rl_kernel_linear_logp_context"] = linear_logp_context
+
+        return output_tensor, partial(f, **callback_kwargs)
 
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
@@ -512,6 +557,10 @@ def train_one_step(
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
+        linear_logp_context = None
+        if _train_should_return_hidden_for_linear_logp(args, return_schedule_plan=return_schedule_plan):
+            linear_logp_context = get_linear_logp_context_from_model(args, model)
+
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             position_ids = None
@@ -539,12 +588,20 @@ def train_one_step(
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
-            output_tensor = model(**forward_kwargs)
+            with return_hidden_states_for_linear_logp(args, model, linear_logp_context):
+                output_tensor = model(**forward_kwargs)
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
+        return output_tensor, partial(
+            loss_function,
+            args,
+            batch,
+            num_microbatches,
+            step_global_batch_size,
+            rl_kernel_linear_logp_context=linear_logp_context,
+        )
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()

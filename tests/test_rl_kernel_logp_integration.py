@@ -37,7 +37,11 @@ class _FakeLogpOp:
 def _reset_rl_kernel_state():
     rlk_mod._LOGP_OP = None
     rlk_mod._LOGP_OP_LOAD_ERROR = None
+    rlk_mod._LINEAR_LOGP_OP = None
+    rlk_mod._LINEAR_LOGP_OP_LOAD_ERROR = None
     rlk_mod._WARNED_FALLBACK_REASONS.clear()
+    rlk_mod._FALLBACK_COUNTS.clear()
+    rlk_mod._FALLBACK_COUNTS.update({"logp": 0, "linear_logp": 0})
     _FakeLogpOp.calls = 0
 
 

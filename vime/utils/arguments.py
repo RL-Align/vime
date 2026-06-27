@@ -167,8 +167,8 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--rl-kernel-ops",
                 type=str,
-                default="logp",
-                help="Comma-separated RL-Kernel ops to enable. Current production integration supports: logp.",
+                default="linear_logp",
+                help="Comma-separated RL-Kernel ops to enable. Current production integration supports: linear_logp.",
             )
             parser.add_argument(
                 "--rl-kernel-strict",

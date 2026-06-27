@@ -3,8 +3,8 @@ from argparse import Namespace
 from collections.abc import Iterable
 
 
-RL_KERNEL_SUPPORTED_OPS = ("logp", "ratio_kl", "grpo_loss")
-RL_KERNEL_INTEGRATED_OPS = ("logp",)
+RL_KERNEL_SUPPORTED_OPS = ("linear_logp",)
+RL_KERNEL_INTEGRATED_OPS = ("linear_logp",)
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 
@@ -12,7 +12,7 @@ _FALSE_VALUES = {"0", "false", "no", "off"}
 def parse_rl_kernel_ops(value: str | Iterable[str] | None) -> tuple[str, ...]:
     """Parse a comma/space separated RL-Kernel op list."""
     if value is None:
-        return ("logp",)
+        return ("linear_logp",)
 
     if isinstance(value, str):
         raw_items = value.replace(",", " ").split()
@@ -32,7 +32,7 @@ def parse_rl_kernel_ops(value: str | Iterable[str] | None) -> tuple[str, ...]:
         if op not in ops:
             ops.append(op)
 
-    return tuple(ops) if ops else ("logp",)
+    return tuple(ops) if ops else ("linear_logp",)
 
 
 def _env_bool(name: str) -> bool | None:
