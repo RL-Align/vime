@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from argparse import Namespace
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,6 +20,13 @@ _LINEAR_LOGP_OP = None
 _LINEAR_LOGP_OP_LOAD_ERROR: Exception | None = None
 _WARNED_FALLBACK_REASONS: set[str] = set()
 _FALLBACK_COUNTS: dict[str, int] = {"logp": 0, "linear_logp": 0}
+_RUNTIME_COUNTER_KEYS = (
+    "linear_logp_call_count",
+    "linear_logp_token_count",
+    "linear_logp_dispatch_elapsed_s",
+)
+_RUNTIME_COUNTERS: dict[str, float] = dict.fromkeys(_RUNTIME_COUNTER_KEYS, 0.0)
+_RUNTIME_COUNTER_LAST_SNAPSHOT: dict[str, float] = dict.fromkeys(_RUNTIME_COUNTER_KEYS, 0.0)
 
 
 @dataclass(frozen=True)
@@ -35,6 +43,31 @@ def get_rl_kernel_fallback_count(op: str | None = None) -> int:
     if op is not None:
         return _FALLBACK_COUNTS.get(op, 0)
     return sum(_FALLBACK_COUNTS.values())
+
+
+def reset_rl_kernel_runtime_counters() -> None:
+    for key in _RUNTIME_COUNTER_KEYS:
+        _RUNTIME_COUNTERS[key] = 0.0
+        _RUNTIME_COUNTER_LAST_SNAPSHOT[key] = 0.0
+
+
+def get_rl_kernel_runtime_counters() -> dict[str, float]:
+    return dict(_RUNTIME_COUNTERS)
+
+
+def get_rl_kernel_runtime_counter_delta() -> dict[str, float]:
+    current = get_rl_kernel_runtime_counters()
+    delta = {
+        key: current.get(key, 0.0) - _RUNTIME_COUNTER_LAST_SNAPSHOT.get(key, 0.0) for key in _RUNTIME_COUNTER_KEYS
+    }
+    _RUNTIME_COUNTER_LAST_SNAPSHOT.update(current)
+    return delta
+
+
+def _record_linear_logp_runtime(token_count: int, elapsed_s: float) -> None:
+    _RUNTIME_COUNTERS["linear_logp_call_count"] += 1.0
+    _RUNTIME_COUNTERS["linear_logp_token_count"] += float(token_count)
+    _RUNTIME_COUNTERS["linear_logp_dispatch_elapsed_s"] += float(elapsed_s)
 
 
 def _warn_fallback(args: Namespace, op: str, reason: str) -> None:
@@ -302,6 +335,7 @@ def maybe_compute_linear_logp(
         if bias is not None:
             bias = bias / rollout_temperature
 
+    start_s = time.perf_counter()
     try:
         log_prob = op(
             hidden_states,
@@ -316,4 +350,5 @@ def maybe_compute_linear_logp(
         _warn_fallback(args, "linear_logp", str(exc))
         return None
 
+    _record_linear_logp_runtime(target_ids.numel(), time.perf_counter() - start_s)
     return log_prob.float().reshape(-1)

@@ -71,6 +71,7 @@ def _reset_rl_kernel_state():
     rlk_mod._WARNED_FALLBACK_REASONS.clear()
     rlk_mod._FALLBACK_COUNTS.clear()
     rlk_mod._FALLBACK_COUNTS.update({"logp": 0, "linear_logp": 0})
+    rlk_mod.reset_rl_kernel_runtime_counters()
     _FakeLinearLogpOp.calls.clear()
 
 
@@ -182,6 +183,34 @@ def test_maybe_compute_linear_logp_passes_tensor_parallel_metadata(monkeypatch):
             },
         }
     ]
+    counters = rlk_mod.get_rl_kernel_runtime_counters()
+    assert counters["linear_logp_call_count"] == 1.0
+    assert counters["linear_logp_token_count"] == 6.0
+    assert counters["linear_logp_dispatch_elapsed_s"] >= 0.0
+
+
+@pytest.mark.unit
+def test_linear_logp_runtime_counter_delta_tracks_since_last_read(monkeypatch):
+    _install_fake_rl_engine(monkeypatch)
+    args = _make_args()
+    hidden = torch.randn(4, 3)
+    weight = torch.randn(5, 3)
+    target = torch.randint(0, 5, (4,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None)
+
+    rlk_mod.maybe_compute_linear_logp(hidden[:2], target[:2], context=context, args=args, with_entropy=False)
+    first_delta = rlk_mod.get_rl_kernel_runtime_counter_delta()
+
+    rlk_mod.maybe_compute_linear_logp(hidden[2:], target[2:], context=context, args=args, with_entropy=False)
+    second_delta = rlk_mod.get_rl_kernel_runtime_counter_delta()
+    totals = rlk_mod.get_rl_kernel_runtime_counters()
+
+    assert first_delta["linear_logp_call_count"] == 1.0
+    assert first_delta["linear_logp_token_count"] == 2.0
+    assert second_delta["linear_logp_call_count"] == 1.0
+    assert second_delta["linear_logp_token_count"] == 2.0
+    assert totals["linear_logp_call_count"] == 2.0
+    assert totals["linear_logp_token_count"] == 4.0
 
 
 @pytest.mark.unit

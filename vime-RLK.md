@@ -1,8 +1,8 @@
-# vime + RL-Kernel linear_logp 2xH100 指标预验证
+# vime + RL-Kernel linear_logp 2xH100 性能预验证
 
 ## 0. 我们要做什么
 
-本轮先在 2xH100 上做小规模 A/B 指标预验证；只有 2 卡已经明显优于 vime 原生路径，才扩大到 8 卡主宣传 benchmark。
+本轮先在 2xH100 上做 A/B 性能预验证，不做 smoke-only。只有 2 卡已经明显优于 vime 原生路径，才扩大到 8 卡主宣传 benchmark。
 
 ```text
 baseline:  RL-Align/vime#2, RL-Kernel off, Qwen3-30B-A3B, 2xH100 colocate
@@ -17,7 +17,7 @@ candidate: RL-Align/vime#2 + RL-Align/RL-Kernel#189, RL-Kernel linear_logp on, Q
 - `mean_log_probs_time_s` 或 `peak_vram_gb` 有明确下降
 - 最好能看到明显收益后再上 8 卡：建议 `mean_log_probs_time_s` 下降 >= 20% 或 `peak_vram_gb` 下降 >= 10%
 
-2 卡结果只作为上 8 卡前的门禁，不直接进入宣传材料。
+2 卡结果只作为上 8 卡前的门禁，不直接进入宣传材料；但该门禁必须放大 selected-logprob workload，能看出 RL-Kernel `linear_logp` 的真实收益。
 
 ## 1. 范围
 
@@ -40,9 +40,9 @@ candidate: RL-Align/vime#2 + RL-Align/RL-Kernel#189, RL-Kernel linear_logp on, Q
 - 训推一致性专项 benchmark
 - MoE expert/router RL-Kernel 算子
 
-## 2. 最小配置
+## 2. 性能预验证配置
 
-先用极小配置确保代码路径能跑通；如果成功，再在同一套 2 卡配置上跑 baseline/candidate A/B。
+默认配置不是 smoke，而是 24 step 的 2 卡性能预验证。核心思路是增加 selected-logprob token 数，让 `linear_logp` 的收益不要被 rollout、update weights 等固定开销完全淹没。
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1
@@ -52,13 +52,13 @@ export MEGATRON_EP=2
 export MEGATRON_CP=1
 export ROLLOUT_NUM_GPUS_PER_ENGINE=2
 
-export NUM_ROLLOUT=8
-export ROLLOUT_BATCH_SIZE=1
-export N_SAMPLES_PER_PROMPT=1
-export GLOBAL_BATCH_SIZE=1
-export MAX_TOKENS_PER_GPU=2048
-export ROLLOUT_MAX_RESPONSE_LEN=512
-export VLLM_GPU_MEMORY_UTILIZATION=0.45
+export NUM_ROLLOUT=24
+export ROLLOUT_BATCH_SIZE=2
+export N_SAMPLES_PER_PROMPT=2
+export GLOBAL_BATCH_SIZE=4
+export MAX_TOKENS_PER_GPU=4096
+export ROLLOUT_MAX_RESPONSE_LEN=1024
+export VLLM_GPU_MEMORY_UTILIZATION=0.50
 
 export VIME_CKPT_DIR=/root/Qwen3-30B-A3B_vime_tp2_dev
 export VIME_DISABLE_SAVE=1
@@ -67,14 +67,14 @@ export VIME_VLLM_ENFORCE_EAGER=1
 export VIME_NO_GRAD_ACCUM_FUSION=1
 ```
 
-如果这组能跑通，再逐步放大：
+如果 2xH100 OOM，先只做这一档降级；降级后仍然不是 smoke，因为 response len 和 step 数保持较大：
 
 ```text
 MAX_TOKENS_PER_GPU=4096
 ROLLOUT_MAX_RESPONSE_LEN=1024
-ROLLOUT_BATCH_SIZE=2
+ROLLOUT_BATCH_SIZE=1
 N_SAMPLES_PER_PROMPT=2
-GLOBAL_BATCH_SIZE=4
+GLOBAL_BATCH_SIZE=2
 ```
 
 ## 3. 拉代码
@@ -160,13 +160,13 @@ export MEGATRON_EP=2
 export MEGATRON_CP=1
 export ROLLOUT_NUM_GPUS_PER_ENGINE=2
 
-export NUM_ROLLOUT=8
-export ROLLOUT_BATCH_SIZE=1
-export N_SAMPLES_PER_PROMPT=1
-export GLOBAL_BATCH_SIZE=1
-export MAX_TOKENS_PER_GPU=2048
-export ROLLOUT_MAX_RESPONSE_LEN=512
-export VLLM_GPU_MEMORY_UTILIZATION=0.45
+export NUM_ROLLOUT=24
+export ROLLOUT_BATCH_SIZE=2
+export N_SAMPLES_PER_PROMPT=2
+export GLOBAL_BATCH_SIZE=4
+export MAX_TOKENS_PER_GPU=4096
+export ROLLOUT_MAX_RESPONSE_LEN=1024
+export VLLM_GPU_MEMORY_UTILIZATION=0.50
 
 export VIME_CKPT_DIR=/root/Qwen3-30B-A3B_vime_tp2_dev
 export VIME_DISABLE_SAVE=1
@@ -193,13 +193,13 @@ export MEGATRON_EP=2
 export MEGATRON_CP=1
 export ROLLOUT_NUM_GPUS_PER_ENGINE=2
 
-export NUM_ROLLOUT=8
-export ROLLOUT_BATCH_SIZE=1
-export N_SAMPLES_PER_PROMPT=1
-export GLOBAL_BATCH_SIZE=1
-export MAX_TOKENS_PER_GPU=2048
-export ROLLOUT_MAX_RESPONSE_LEN=512
-export VLLM_GPU_MEMORY_UTILIZATION=0.45
+export NUM_ROLLOUT=24
+export ROLLOUT_BATCH_SIZE=2
+export N_SAMPLES_PER_PROMPT=2
+export GLOBAL_BATCH_SIZE=4
+export MAX_TOKENS_PER_GPU=4096
+export ROLLOUT_MAX_RESPONSE_LEN=1024
+export VLLM_GPU_MEMORY_UTILIZATION=0.50
 
 export VIME_CKPT_DIR=/root/Qwen3-30B-A3B_vime_tp2_dev
 export VIME_DISABLE_SAVE=1
@@ -224,6 +224,9 @@ candidate 必须满足：
 RL-Kernel linear_logp backend 被加载
 VIME_RL_KERNEL_STRICT=1 没有触发 RuntimeError
 rl_kernel_fallback_count = 0
+rl_kernel_linear_logp_call_count_delta > 0
+rl_kernel_linear_logp_token_count_delta > 0
+rl_kernel_linear_logp_dispatch_elapsed_s_delta > 0
 log_probs / loss / reward 指标为 finite
 raw_reward 不低于 baseline 同量级
 train_rollout_logprob_abs_diff 不持续高于 baseline
@@ -233,6 +236,8 @@ mean_log_probs_time_s 或 peak_vram_gb 有明确下降
 2 卡上卡门槛：
 
 ```text
+每组至少 24 train step
+丢弃前 5 step warmup
 mean_log_probs_time_s 下降 >= 20%
 或 peak_vram_gb 下降 >= 10%
 或二者都有小幅但稳定下降，且 mean_step_time_s 不明显变差
@@ -246,6 +251,17 @@ target vocab shard 报错
 TP collective hang
 loss/logprob NaN 或 Inf
 candidate 质量指标明显劣于 baseline
+rl_kernel_linear_logp_call_count_delta 长时间为 0
+rl_kernel_linear_logp_token_count_delta 只覆盖极少 token
+```
+
+runtime counter 解释：
+
+```text
+*_total：当前进程累计命中的 RL-Kernel linear_logp 调用、token 和 dispatch 耗时。
+*_delta：两次 train log 之间新增的调用、token 和 dispatch 耗时；第一个 train step 会覆盖此前 ref-logprob 加本 step train-logprob。
+tokens_per_call = token_count_delta / max(call_count_delta, 1)，用于判断是否只是空调用或很小 workload。
+dispatch_elapsed_s 不做 CUDA synchronize，不作为 GPU kernel time 宣传；正式性能仍看 mean_log_probs_time_s、step time 和 profiler。
 ```
 
 ## 9. 必须记录
@@ -269,6 +285,14 @@ rollout_max_response_len
 vllm_gpu_memory_utilization
 selected_rl_kernel_backend
 rl_kernel_fallback_count
+rl_kernel_linear_logp_call_count_total
+rl_kernel_linear_logp_call_count_delta
+rl_kernel_linear_logp_token_count_total
+rl_kernel_linear_logp_token_count_delta
+rl_kernel_linear_logp_dispatch_elapsed_s_total
+rl_kernel_linear_logp_dispatch_elapsed_s_delta
+rl_kernel_linear_logp_tokens_per_call_total
+rl_kernel_linear_logp_tokens_per_call_delta
 first_successful_train_step
 mean_step_time_s
 p50_step_time_s

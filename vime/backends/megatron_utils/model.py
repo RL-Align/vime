@@ -39,6 +39,8 @@ from .loss import get_log_probs_and_entropy, loss_function
 from .model_provider import get_model_provider_func
 from .rl_kernel import (
     get_linear_logp_context_from_model,
+    get_rl_kernel_runtime_counter_delta,
+    get_rl_kernel_runtime_counters,
     return_hidden_states_for_linear_logp,
     should_use_linear_logp_model_output,
     warn_linear_logp_fallback,
@@ -852,6 +854,21 @@ def train(
 
             # Per-step gbs — uneven step sizes are easy to miss without this.
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
+            if role == "actor" and getattr(args, "enable_rl_kernel", False):
+                runtime_totals = get_rl_kernel_runtime_counters()
+                runtime_delta = get_rl_kernel_runtime_counter_delta()
+                for key, value in runtime_totals.items():
+                    log_dict[f"train/rl_kernel_{key}_total"] = value
+                for key, value in runtime_delta.items():
+                    log_dict[f"train/rl_kernel_{key}_delta"] = value
+                total_calls = runtime_totals.get("linear_logp_call_count", 0.0)
+                delta_calls = runtime_delta.get("linear_logp_call_count", 0.0)
+                log_dict["train/rl_kernel_linear_logp_tokens_per_call_total"] = (
+                    runtime_totals.get("linear_logp_token_count", 0.0) / total_calls if total_calls > 0 else 0.0
+                )
+                log_dict["train/rl_kernel_linear_logp_tokens_per_call_delta"] = (
+                    runtime_delta.get("linear_logp_token_count", 0.0) / delta_calls if delta_calls > 0 else 0.0
+                )
             log_dict["train/step"] = accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")
 
