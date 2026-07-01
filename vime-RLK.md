@@ -1,23 +1,23 @@
-# vime + RL-Kernel linear_logp 2xH100 最小开发验证
+# vime + RL-Kernel linear_logp 2xH100 指标预验证
 
 ## 0. 我们要做什么
 
-本轮不是主宣传 benchmark，而是 2xH100 最小开发验证：
+本轮先在 2xH100 上做小规模 A/B 指标预验证；只有 2 卡已经明显优于 vime 原生路径，才扩大到 8 卡主宣传 benchmark。
 
 ```text
-candidate: RL-Align/vime#2 + RL-Align/RL-Kernel#189
-model:     Qwen3-30B-A3B
-hardware:  2xH100 colocate
-op:        RL-Kernel linear_logp
+baseline:  RL-Align/vime#2, RL-Kernel off, Qwen3-30B-A3B, 2xH100 colocate
+candidate: RL-Align/vime#2 + RL-Align/RL-Kernel#189, RL-Kernel linear_logp on, Qwen3-30B-A3B, 2xH100 colocate
 ```
 
-目标只验证三件事：
+2 卡阶段仍然使用和 8 卡一致的指标验收线：
 
-- vime 可以在 2xH100 上启动 Qwen3-30B-A3B 最小训练链路。
-- `VIME_RL_KERNEL=1` 后能进入 RL-Kernel `linear_logp` 路径。
-- `VIME_RL_KERNEL_STRICT=1` 下 `rl_kernel_fallback_count = 0`，至少完成 1 个 train step。
+- `rl_kernel_fallback_count = 0`
+- `raw_reward` 不低于 baseline 同量级
+- `train_rollout_logprob_abs_diff` 不持续高于 baseline
+- `mean_log_probs_time_s` 或 `peak_vram_gb` 有明确下降
+- 最好能看到明显收益后再上 8 卡：建议 `mean_log_probs_time_s` 下降 >= 20% 或 `peak_vram_gb` 下降 >= 10%
 
-不产出宣传结论；不比较速度收益；不画最终 benchmark 图。
+2 卡结果只作为上 8 卡前的门禁，不直接进入宣传材料。
 
 ## 1. 范围
 
@@ -27,7 +27,8 @@ op:        RL-Kernel linear_logp
 - Qwen3-30B-A3B
 - TP=2
 - 2xH100 单机 colocate
-- candidate 必跑，baseline 只做可选环境 sanity check
+- baseline 和 candidate 都必须跑
+- 指标集合与 8xH100 主 benchmark 保持一致
 
 不做：
 
@@ -41,7 +42,7 @@ op:        RL-Kernel linear_logp
 
 ## 2. 最小配置
 
-从极小 batch 开始，先保证代码路径跑通：
+先用极小配置确保代码路径能跑通；如果成功，再在同一套 2 卡配置上跑 baseline/candidate A/B。
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1
@@ -145,7 +146,42 @@ PYTHONPATH=/root/Megatron-LM torchrun --nproc-per-node 2 \
 mkdir -p /root/Qwen3-30B-A3B_vime_tp2_dev
 ```
 
-## 6. 跑 candidate
+## 6. 跑 baseline
+
+baseline 必跑，用来代表 vime 原生路径；不要打开 RL-Kernel。
+
+```bash
+cd /workspace/vime-rlk-tp2
+
+export CUDA_VISIBLE_DEVICES=0,1
+export NUM_GPUS=2
+export MEGATRON_TP=2
+export MEGATRON_EP=2
+export MEGATRON_CP=1
+export ROLLOUT_NUM_GPUS_PER_ENGINE=2
+
+export NUM_ROLLOUT=8
+export ROLLOUT_BATCH_SIZE=1
+export N_SAMPLES_PER_PROMPT=1
+export GLOBAL_BATCH_SIZE=1
+export MAX_TOKENS_PER_GPU=2048
+export ROLLOUT_MAX_RESPONSE_LEN=512
+export VLLM_GPU_MEMORY_UTILIZATION=0.45
+
+export VIME_CKPT_DIR=/root/Qwen3-30B-A3B_vime_tp2_dev
+export VIME_DISABLE_SAVE=1
+export VIME_SKIP_EVAL_BEFORE_TRAIN=1
+export VIME_VLLM_ENFORCE_EAGER=1
+export VIME_NO_GRAD_ACCUM_FUSION=1
+
+unset VIME_RL_KERNEL VIME_RL_KERNEL_OPS VIME_RL_KERNEL_STRICT
+
+bash scripts/run-qwen3-30B-A3B.sh 2>&1 | tee /workspace/vime-rlk-tp2-baseline.log
+```
+
+## 7. 跑 candidate
+
+candidate 使用同一套 2 卡配置，只打开 RL-Kernel。
 
 ```bash
 cd /workspace/vime-rlk-tp2
@@ -178,35 +214,28 @@ export VIME_RL_KERNEL_STRICT=1
 bash scripts/run-qwen3-30B-A3B.sh 2>&1 | tee /workspace/vime-rlk-tp2-candidate.log
 ```
 
-## 7. 可选 baseline sanity check
-
-baseline 只用于确认环境和 vime 脚本本身能跑，不用于性能对比。
-
-```bash
-cd /workspace/vime-rlk-tp2
-unset VIME_RL_KERNEL VIME_RL_KERNEL_OPS VIME_RL_KERNEL_STRICT
-bash scripts/run-qwen3-30B-A3B.sh 2>&1 | tee /workspace/vime-rlk-tp2-baseline.log
-```
-
 ## 8. 验收线
 
-candidate 日志必须满足：
+每组先跑 1 次确认无错误；稳定后 baseline/candidate 各跑至少 3 次，丢弃前 5-10 step warmup 后统计。
+
+candidate 必须满足：
 
 ```text
 RL-Kernel linear_logp backend 被加载
 VIME_RL_KERNEL_STRICT=1 没有触发 RuntimeError
 rl_kernel_fallback_count = 0
-至少完成 1 个 train step
 log_probs / loss / reward 指标为 finite
+raw_reward 不低于 baseline 同量级
+train_rollout_logprob_abs_diff 不持续高于 baseline
+mean_log_probs_time_s 或 peak_vram_gb 有明确下降
 ```
 
-允许：
+2 卡上卡门槛：
 
 ```text
-step time 不稳定
-reward 无明显趋势
-吞吐很低
-显存接近上限
+mean_log_probs_time_s 下降 >= 20%
+或 peak_vram_gb 下降 >= 10%
+或二者都有小幅但稳定下降，且 mean_step_time_s 不明显变差
 ```
 
 不允许：
@@ -216,6 +245,7 @@ fallback 到 vime materialized logits 路径
 target vocab shard 报错
 TP collective hang
 loss/logprob NaN 或 Inf
+candidate 质量指标明显劣于 baseline
 ```
 
 ## 9. 必须记录
@@ -240,13 +270,21 @@ vllm_gpu_memory_utilization
 selected_rl_kernel_backend
 rl_kernel_fallback_count
 first_successful_train_step
+mean_step_time_s
+p50_step_time_s
+p90_step_time_s
+mean_log_probs_time_s
+p50_log_probs_time_s
+p90_log_probs_time_s
 peak_vram_gb
+raw_reward_mean
+train_rollout_logprob_abs_diff_mean
 error_stack_if_failed
 ```
 
 ## 10. 下一步
 
-2xH100 通过后再进入正式 benchmark：
+2xH100 指标门禁通过后再进入正式 benchmark：
 
 ```text
 8xH100

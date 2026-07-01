@@ -31,10 +31,36 @@ else
     DETECTED_GPUS=0
     DETECTED_GPU_NAME="unknown"
 fi
-NUM_GPUS=${NUM_GPUS:-8}
-if [ -z "$NUM_GPUS" ] || [ "$NUM_GPUS" -le 0 ]; then
-    NUM_GPUS=8
-fi
+
+validate_positive_int() {
+    local name="$1"
+    local value="$2"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -le 0 ]; then
+        echo "${name} must be a positive integer, got '${value}'" >&2
+        exit 1
+    fi
+}
+
+validate_at_most_num_gpus() {
+    local name="$1"
+    local value="$2"
+    if [ "$value" -gt "$NUM_GPUS" ]; then
+        echo "${name}=${value} cannot exceed NUM_GPUS=${NUM_GPUS}" >&2
+        exit 1
+    fi
+}
+
+validate_divides_num_gpus() {
+    local name="$1"
+    local value="$2"
+    if [ $((NUM_GPUS % value)) -ne 0 ]; then
+        echo "${name}=${value} must divide NUM_GPUS=${NUM_GPUS}" >&2
+        exit 1
+    fi
+}
+
+NUM_GPUS=${NUM_GPUS:-2}
+validate_positive_int "NUM_GPUS" "$NUM_GPUS"
 if [ "$DETECTED_GPUS" -gt 0 ] && [ "$NUM_GPUS" -gt "$DETECTED_GPUS" ]; then
     echo "Requested NUM_GPUS=$NUM_GPUS but only detected $DETECTED_GPUS GPUs" >&2
     exit 1
@@ -49,15 +75,49 @@ source "${SCRIPT_DIR}/models/qwen3-30B-A3B.sh"
 MEGATRON_TP=${MEGATRON_TP:-2}
 MEGATRON_EP=${MEGATRON_EP:-${NUM_GPUS}}
 MEGATRON_CP=${MEGATRON_CP:-1}
-MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-20480}
-NUM_ROLLOUT=${NUM_ROLLOUT:-3000}
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-32}
-N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
-ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-8192}
+MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-2048}
+NUM_ROLLOUT=${NUM_ROLLOUT:-8}
+ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-1}
+N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-1}
+ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-512}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
 ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-${NUM_GPUS}}
-VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.7}
-VIME_CKPT_DIR=${VIME_CKPT_DIR:-/root/Qwen3-30B-A3B_vime}
+VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.45}
+VIME_CKPT_DIR=${VIME_CKPT_DIR:-/root/Qwen3-30B-A3B_vime_tp2_dev}
+VIME_DISABLE_SAVE=${VIME_DISABLE_SAVE:-1}
+VIME_SKIP_EVAL_BEFORE_TRAIN=${VIME_SKIP_EVAL_BEFORE_TRAIN:-1}
+VIME_VLLM_ENFORCE_EAGER=${VIME_VLLM_ENFORCE_EAGER:-1}
+VIME_NO_GRAD_ACCUM_FUSION=${VIME_NO_GRAD_ACCUM_FUSION:-1}
+
+validate_positive_int "MEGATRON_TP" "$MEGATRON_TP"
+validate_positive_int "MEGATRON_EP" "$MEGATRON_EP"
+validate_positive_int "MEGATRON_CP" "$MEGATRON_CP"
+validate_positive_int "MAX_TOKENS_PER_GPU" "$MAX_TOKENS_PER_GPU"
+validate_positive_int "NUM_ROLLOUT" "$NUM_ROLLOUT"
+validate_positive_int "ROLLOUT_BATCH_SIZE" "$ROLLOUT_BATCH_SIZE"
+validate_positive_int "N_SAMPLES_PER_PROMPT" "$N_SAMPLES_PER_PROMPT"
+validate_positive_int "ROLLOUT_MAX_RESPONSE_LEN" "$ROLLOUT_MAX_RESPONSE_LEN"
+validate_positive_int "GLOBAL_BATCH_SIZE" "$GLOBAL_BATCH_SIZE"
+validate_positive_int "ROLLOUT_NUM_GPUS_PER_ENGINE" "$ROLLOUT_NUM_GPUS_PER_ENGINE"
+validate_at_most_num_gpus "MEGATRON_TP" "$MEGATRON_TP"
+validate_at_most_num_gpus "MEGATRON_EP" "$MEGATRON_EP"
+validate_at_most_num_gpus "ROLLOUT_NUM_GPUS_PER_ENGINE" "$ROLLOUT_NUM_GPUS_PER_ENGINE"
+validate_divides_num_gpus "MEGATRON_TP" "$MEGATRON_TP"
+validate_divides_num_gpus "MEGATRON_EP" "$MEGATRON_EP"
+validate_divides_num_gpus "ROLLOUT_NUM_GPUS_PER_ENGINE" "$ROLLOUT_NUM_GPUS_PER_ENGINE"
+
+echo "MEGATRON_TP: $MEGATRON_TP"
+echo "MEGATRON_EP: $MEGATRON_EP"
+echo "MEGATRON_CP: $MEGATRON_CP"
+echo "ROLLOUT_NUM_GPUS_PER_ENGINE: $ROLLOUT_NUM_GPUS_PER_ENGINE"
+echo "NUM_ROLLOUT: $NUM_ROLLOUT"
+echo "ROLLOUT_BATCH_SIZE: $ROLLOUT_BATCH_SIZE"
+echo "N_SAMPLES_PER_PROMPT: $N_SAMPLES_PER_PROMPT"
+echo "GLOBAL_BATCH_SIZE: $GLOBAL_BATCH_SIZE"
+echo "MAX_TOKENS_PER_GPU: $MAX_TOKENS_PER_GPU"
+echo "ROLLOUT_MAX_RESPONSE_LEN: $ROLLOUT_MAX_RESPONSE_LEN"
+echo "VLLM_GPU_MEMORY_UTILIZATION: $VLLM_GPU_MEMORY_UTILIZATION"
+echo "VIME_CKPT_DIR: $VIME_CKPT_DIR"
 
 CKPT_ARGS=(
    --hf-checkpoint /root/Qwen3-30B-A3B
