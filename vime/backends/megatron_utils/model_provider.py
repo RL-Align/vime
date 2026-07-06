@@ -1,6 +1,7 @@
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
 import argparse
 import inspect
+import logging
 import re
 from contextlib import nullcontext
 from typing import Literal
@@ -19,6 +20,8 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 from vime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 from vime.utils.misc import load_function
+
+logger = logging.getLogger(__name__)
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -269,12 +272,38 @@ def get_model_provider_func(args, role="actor"):
 
 def freeze_model_params(model: GPTModel, args: argparse.Namespace):
     if getattr(args, "only_train_params_name_list", None):
+        matched_names = []
         for name, param in model.named_parameters():
             param.requires_grad = False
             for pattern in args.only_train_params_name_list:
                 if re.search(pattern, name):
                     param.requires_grad = True
+                    matched_names.append(name)
                     break
+
+        wants_output_layer = any(
+            re.search(pattern, "output_layer.weight") for pattern in args.only_train_params_name_list
+        )
+        matched_output_layer = any("output_layer" in name for name in matched_names)
+        if wants_output_layer and not matched_output_layer and getattr(model, "share_embeddings_and_output_weights", False):
+            shared_weight = None
+            shared_weight_fn = getattr(model, "shared_embedding_or_output_weight", None)
+            if callable(shared_weight_fn):
+                try:
+                    shared_weight = shared_weight_fn()
+                except Exception:
+                    logger.debug("Unable to read shared embedding/output weight for output-layer-only training.", exc_info=True)
+            if isinstance(shared_weight, torch.Tensor):
+                shared_weight.requires_grad_(True)
+                logger.info(
+                    "Training shared embedding/output weight for output_layer pattern because "
+                    "this model ties embeddings and output weights."
+                )
+            else:
+                logger.warning(
+                    "only_train_params_name_list requested output_layer, but no output_layer "
+                    "parameter or shared embedding/output weight was found."
+                )
 
     if getattr(args, "freeze_params_name_list", None):
         for name, param in model.named_parameters():

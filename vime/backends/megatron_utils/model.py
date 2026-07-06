@@ -3,8 +3,10 @@ import gc
 import logging
 import math
 import os
+import time
 from argparse import Namespace
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
@@ -29,9 +31,18 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 
 from vime.utils import logging_utils
-from vime.utils.memory_utils import clear_memory
+from vime.utils.memory_utils import clear_memory, update_peak_memory_tracker
 from vime.utils.rl_kernel import is_rl_kernel_op_enabled
 
+from .baseline_timer import (
+    baseline_cuda_event_timer_enabled,
+    baseline_linear_logp_timer_enabled,
+    get_baseline_linear_logp_runtime_counter_delta,
+    get_baseline_linear_logp_runtime_counters,
+    queue_baseline_output_layer_cuda_event,
+    queue_baseline_output_layer_forward_backward_cuda_event,
+    record_baseline_output_layer_runtime,
+)
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
@@ -81,6 +92,221 @@ def _wrap_forward_step_with_microbatch_pbar(forward_step_func, pbar):
         return result
 
     return wrapped_forward_step
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _first_tensor(value):
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            tensor = _first_tensor(item)
+            if tensor is not None:
+                return tensor
+    if isinstance(value, dict):
+        for item in value.values():
+            tensor = _first_tensor(item)
+            if tensor is not None:
+                return tensor
+    return None
+
+
+def _detach_first_tensor(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach(), True
+    if isinstance(value, tuple):
+        new_items = []
+        changed = False
+        for item in value:
+            if not changed:
+                new_item, changed = _detach_first_tensor(item)
+                new_items.append(new_item)
+            else:
+                new_items.append(item)
+        return tuple(new_items), changed
+    if isinstance(value, list):
+        new_items = []
+        changed = False
+        for item in value:
+            if not changed:
+                new_item, changed = _detach_first_tensor(item)
+                new_items.append(new_item)
+            else:
+                new_items.append(item)
+        return new_items, changed
+    if isinstance(value, dict):
+        new_value = dict(value)
+        for key, item in value.items():
+            new_item, changed = _detach_first_tensor(item)
+            if changed:
+                new_value[key] = new_item
+                return new_value, True
+    return value, False
+
+
+@contextmanager
+def _probe_baseline_output_layer_forward(args: Namespace, model):
+    memory_probe = _env_flag("VIME_LINEAR_LOGP_MEMORY_PROBE")
+    runtime_timer = baseline_linear_logp_timer_enabled(args)
+    event_timer = baseline_cuda_event_timer_enabled(args)
+    detach_hidden = _env_flag("VIME_BASELINE_OUTPUT_LAYER_DETACH_HIDDEN")
+    if getattr(args, "enable_rl_kernel", False) or not (memory_probe or runtime_timer or event_timer or detach_hidden):
+        yield
+        return
+
+    module = model
+    while hasattr(module, "module"):
+        module = module.module
+    output_layer = getattr(module, "output_layer", None)
+    if output_layer is None:
+        yield
+        return
+
+    state: dict[str, object] = {}
+    backward_handles = []
+
+    def register_backward_event_timer(module, input_tensor, start_event):
+        watched_tensor = None
+        # Prefer the layer input for full-gradient timing; tied/shared output
+        # weights may get gradient contributions outside the output layer.
+        for candidate in (input_tensor, getattr(module, "weight", None), getattr(module, "bias", None)):
+            if isinstance(candidate, torch.Tensor) and candidate.requires_grad:
+                watched_tensor = candidate
+                break
+        if watched_tensor is None:
+            return
+
+        handle_box = {}
+
+        def hook(grad):
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            queue_baseline_output_layer_forward_backward_cuda_event(
+                start_event,
+                end_event,
+            )
+            handle = handle_box.get("handle")
+            if handle is not None:
+                handle.remove()
+                if handle in backward_handles:
+                    backward_handles.remove(handle)
+            return grad
+
+        handle_box["handle"] = watched_tensor.register_hook(hook)
+        backward_handles.append(handle_box["handle"])
+
+    def pre_hook(_module, inputs, kwargs):
+        input_tensor = kwargs.get("input_") if isinstance(kwargs, dict) else None
+        if input_tensor is None:
+            input_tensor = _first_tensor(inputs)
+        if input_tensor is None or not input_tensor.is_cuda:
+            state.clear()
+            if detach_hidden:
+                new_inputs, inputs_changed = _detach_first_tensor(inputs)
+                new_kwargs, kwargs_changed = _detach_first_tensor(kwargs)
+                if inputs_changed or kwargs_changed:
+                    return new_inputs, new_kwargs
+            return None
+        new_inputs = inputs
+        new_kwargs = kwargs
+        if detach_hidden:
+            if isinstance(kwargs, dict) and isinstance(kwargs.get("input_"), torch.Tensor):
+                new_kwargs = dict(kwargs)
+                new_kwargs["input_"] = kwargs["input_"].detach()
+                input_tensor = new_kwargs["input_"]
+            else:
+                new_inputs, _changed = _detach_first_tensor(inputs)
+                input_tensor = _first_tensor(new_inputs)
+        probe_device = input_tensor.device
+        state.clear()
+        tokens = int(input_tensor.numel() // input_tensor.size(-1)) if input_tensor.dim() > 0 else 0
+        if memory_probe:
+            torch.cuda.synchronize(probe_device)
+        state.update(
+            {
+                "device": probe_device,
+                "input_shape": tuple(input_tensor.shape),
+                "tokens": tokens,
+            }
+        )
+        if runtime_timer:
+            state["timer_start_s"] = time.perf_counter()
+        if event_timer:
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            state["cuda_event_start"] = start_event
+            if torch.is_grad_enabled():
+                register_backward_event_timer(_module, input_tensor, start_event)
+        if memory_probe:
+            state["alloc_before"] = torch.cuda.memory_allocated(probe_device)
+            state["reserved_before"] = torch.cuda.memory_reserved(probe_device)
+            update_peak_memory_tracker("actor_train", device=probe_device)
+            torch.cuda.reset_peak_memory_stats(probe_device)
+        if detach_hidden:
+            return new_inputs, new_kwargs
+        return None
+
+    def post_hook(_module, _inputs, output):
+        if not state:
+            return
+        probe_device = state["device"]
+        timer_start_s = state.get("timer_start_s")
+        if timer_start_s is not None:
+            record_baseline_output_layer_runtime(int(state["tokens"]), time.perf_counter() - float(timer_start_s))
+        cuda_event_start = state.get("cuda_event_start")
+        if cuda_event_start is not None:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            queue_baseline_output_layer_cuda_event(
+                cuda_event_start,
+                end_event,
+            )
+        if not memory_probe:
+            state.clear()
+            return
+
+        output_tensor = _first_tensor(output)
+        torch.cuda.synchronize(probe_device)
+        alloc_before = int(state["alloc_before"])
+        reserved_before = int(state["reserved_before"])
+        alloc_after = torch.cuda.memory_allocated(probe_device)
+        reserved_after = torch.cuda.memory_reserved(probe_device)
+        peak_alloc = torch.cuda.max_memory_allocated(probe_device)
+        peak_reserved = torch.cuda.max_memory_reserved(probe_device)
+        update_peak_memory_tracker(
+            "actor_train",
+            peak_alloc=peak_alloc,
+            peak_reserved=peak_reserved,
+            device=probe_device,
+        )
+        logger.info(
+            "Baseline output_layer memory_probe: op=%s input_shape=%s output_shape=%s "
+            "tokens=%d alloc_before_mb=%.2f peak_alloc_mb=%.2f peak_delta_mb=%.2f "
+            "alloc_after_mb=%.2f alloc_after_delta_mb=%.2f reserved_before_mb=%.2f reserved_after_mb=%.2f",
+            type(_module).__name__,
+            state["input_shape"],
+            None if output_tensor is None else tuple(output_tensor.shape),
+            int(state["tokens"]),
+            alloc_before / (1024**2),
+            peak_alloc / (1024**2),
+            (peak_alloc - alloc_before) / (1024**2),
+            alloc_after / (1024**2),
+            (alloc_after - alloc_before) / (1024**2),
+            reserved_before / (1024**2),
+            reserved_after / (1024**2),
+        )
+        state.clear()
+
+    pre_handle = output_layer.register_forward_pre_hook(pre_hook, with_kwargs=True)
+    post_handle = output_layer.register_forward_hook(post_hook)
+    try:
+        yield
+    finally:
+        pre_handle.remove()
+        post_handle.remove()
 
 
 def _forward_only_should_return_hidden_for_linear_logp(
@@ -385,8 +611,9 @@ def forward_only(
         if _forward_only_should_return_hidden_for_linear_logp(f, args):
             linear_logp_context = get_linear_logp_context_from_model(args, model)
 
-        with return_hidden_states_for_linear_logp(args, model, linear_logp_context):
-            output_tensor = model(**forward_kwargs)
+        with _probe_baseline_output_layer_forward(args, model):
+            with return_hidden_states_for_linear_logp(args, model, linear_logp_context):
+                output_tensor = model(**forward_kwargs)
 
         callback_kwargs = {
             "args": args,
@@ -590,8 +817,9 @@ def train_one_step(
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
-            with return_hidden_states_for_linear_logp(args, model, linear_logp_context):
-                output_tensor = model(**forward_kwargs)
+            with _probe_baseline_output_layer_forward(args, model):
+                with return_hidden_states_for_linear_logp(args, model, linear_logp_context):
+                    output_tensor = model(**forward_kwargs)
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -868,6 +1096,94 @@ def train(
                 )
                 log_dict["train/rl_kernel_linear_logp_tokens_per_call_delta"] = (
                     runtime_delta.get("linear_logp_token_count", 0.0) / delta_calls if delta_calls > 0 else 0.0
+                )
+            if role == "actor" and baseline_linear_logp_timer_enabled(args):
+                runtime_totals = get_baseline_linear_logp_runtime_counters()
+                runtime_delta = get_baseline_linear_logp_runtime_counter_delta()
+                for key, value in runtime_totals.items():
+                    log_dict[f"train/baseline_{key}_total"] = value
+                for key, value in runtime_delta.items():
+                    log_dict[f"train/baseline_{key}_delta"] = value
+
+                total_calls = max(
+                    runtime_totals.get("output_layer_call_count", 0.0),
+                    runtime_totals.get("native_logprob_call_count", 0.0),
+                )
+                delta_calls = max(
+                    runtime_delta.get("output_layer_call_count", 0.0),
+                    runtime_delta.get("native_logprob_call_count", 0.0),
+                )
+                total_tokens = max(
+                    runtime_totals.get("output_layer_token_count", 0.0),
+                    runtime_totals.get("native_logprob_token_count", 0.0),
+                )
+                delta_tokens = max(
+                    runtime_delta.get("output_layer_token_count", 0.0),
+                    runtime_delta.get("native_logprob_token_count", 0.0),
+                )
+                total_elapsed_s = (
+                    runtime_totals.get("output_layer_dispatch_elapsed_s", 0.0)
+                    + runtime_totals.get("native_logprob_dispatch_elapsed_s", 0.0)
+                )
+                delta_elapsed_s = (
+                    runtime_delta.get("output_layer_dispatch_elapsed_s", 0.0)
+                    + runtime_delta.get("native_logprob_dispatch_elapsed_s", 0.0)
+                )
+                total_cuda_event_elapsed_s = (
+                    runtime_totals.get("output_layer_cuda_event_elapsed_s", 0.0)
+                    + runtime_totals.get("native_logprob_cuda_event_elapsed_s", 0.0)
+                )
+                delta_cuda_event_elapsed_s = (
+                    runtime_delta.get("output_layer_cuda_event_elapsed_s", 0.0)
+                    + runtime_delta.get("native_logprob_cuda_event_elapsed_s", 0.0)
+                )
+                total_forward_backward_cuda_event_count = runtime_totals.get(
+                    "output_layer_forward_backward_cuda_event_count", 0.0
+                )
+                delta_forward_backward_cuda_event_count = runtime_delta.get(
+                    "output_layer_forward_backward_cuda_event_count", 0.0
+                )
+                total_forward_backward_cuda_event_elapsed_s = runtime_totals.get(
+                    "output_layer_forward_backward_cuda_event_elapsed_s", 0.0
+                )
+                delta_forward_backward_cuda_event_elapsed_s = runtime_delta.get(
+                    "output_layer_forward_backward_cuda_event_elapsed_s", 0.0
+                )
+                log_dict["train/baseline_linear_logp_call_count_total"] = total_calls
+                log_dict["train/baseline_linear_logp_call_count_delta"] = delta_calls
+                log_dict["train/baseline_linear_logp_token_count_total"] = total_tokens
+                log_dict["train/baseline_linear_logp_token_count_delta"] = delta_tokens
+                log_dict["train/baseline_linear_logp_dispatch_elapsed_s_total"] = total_elapsed_s
+                log_dict["train/baseline_linear_logp_dispatch_elapsed_s_delta"] = delta_elapsed_s
+                log_dict["train/baseline_linear_logp_forward_cuda_event_elapsed_s_total"] = (
+                    total_cuda_event_elapsed_s
+                )
+                log_dict["train/baseline_linear_logp_forward_cuda_event_elapsed_s_delta"] = (
+                    delta_cuda_event_elapsed_s
+                )
+                log_dict["train/baseline_linear_logp_forward_backward_cuda_event_count_total"] = (
+                    total_forward_backward_cuda_event_count
+                )
+                log_dict["train/baseline_linear_logp_forward_backward_cuda_event_count_delta"] = (
+                    delta_forward_backward_cuda_event_count
+                )
+                log_dict["train/baseline_linear_logp_forward_backward_cuda_event_elapsed_s_total"] = (
+                    total_forward_backward_cuda_event_elapsed_s
+                )
+                log_dict["train/baseline_linear_logp_forward_backward_cuda_event_elapsed_s_delta"] = (
+                    delta_forward_backward_cuda_event_elapsed_s
+                )
+                log_dict["train/baseline_linear_logp_cuda_event_elapsed_s_total"] = (
+                    total_cuda_event_elapsed_s
+                )
+                log_dict["train/baseline_linear_logp_cuda_event_elapsed_s_delta"] = (
+                    delta_cuda_event_elapsed_s
+                )
+                log_dict["train/baseline_linear_logp_tokens_per_call_total"] = (
+                    total_tokens / total_calls if total_calls > 0 else 0.0
+                )
+                log_dict["train/baseline_linear_logp_tokens_per_call_delta"] = (
+                    delta_tokens / delta_calls if delta_calls > 0 else 0.0
                 )
             log_dict["train/step"] = accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")

@@ -1,4 +1,5 @@
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -57,6 +58,7 @@ def get_batch(
     batch = data_iterator.get_next(keys)
 
     tokens = batch["tokens"]
+    num_real_sequences = len(tokens)
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
@@ -120,6 +122,13 @@ def get_batch(
             max_seqlen_kv=max_seqlen,
             qkv_format="thd",
         )
+        if (
+            os.environ.get("MEGATRON_LOCAL_ATTENTION_SINGLE_PACKED_SEQ", "0") == "1"
+            and cp_size == 1
+            and not allgather_cp
+            and num_real_sequences == 1
+        ):
+            packed_seq_params = None
 
         tokens = tokens.unsqueeze(0)
     else:

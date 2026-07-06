@@ -1,4 +1,5 @@
 import inspect
+import os
 import re
 from argparse import Namespace
 from collections.abc import Iterator, Sequence
@@ -125,6 +126,9 @@ def named_params_and_buffers(
         ans = _named_params_and_buffers_global(args, model)
     else:
         ans = _named_params_and_buffers_vanilla(model)
+
+    if os.environ.get("VIME_SYNC_TRAINABLE_WEIGHTS_ONLY", "0") == "1":
+        ans = ((name, tensor) for name, tensor in ans if getattr(tensor, "requires_grad", False))
 
     if translate_gpu_to_cpu:
         ans = ((name, _maybe_get_cpu_backup(tensor)) for name, tensor in ans)

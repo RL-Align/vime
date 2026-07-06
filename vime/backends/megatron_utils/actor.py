@@ -17,7 +17,12 @@ from vime.utils import train_dump_utils
 from vime.utils.data import process_rollout_data
 from vime.utils.distributed_utils import get_gloo_group
 from vime.utils.logging_utils import init_tracking
-from vime.utils.memory_utils import clear_memory, print_memory
+from vime.utils.memory_utils import (
+    clear_memory,
+    get_peak_memory_tracker,
+    print_memory,
+    reset_peak_memory_tracker,
+)
 from vime.utils.misc import Box
 from vime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from vime.utils.routing_replay import RoutingReplay
@@ -41,7 +46,126 @@ logging.getLogger("megatron").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_capture_rollouts(value: str) -> set[int] | str:
+    text = value.strip().lower()
+    if text in {"all", "*"}:
+        return "all"
+    result: set[int] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            start, end = int(start_s), int(end_s)
+            result.update(range(start, end + 1))
+        else:
+            result.add(int(part))
+    return result
+
+
+def _should_nsys_capture(role: str, rollout_id: int) -> bool:
+    value = os.getenv("VIME_NSYS_CAPTURE_ROLLOUTS", "").strip()
+    if not value:
+        return False
+    capture_role = os.getenv("VIME_NSYS_CAPTURE_ROLE", "actor").strip().lower()
+    if capture_role not in {"all", role.lower()}:
+        return False
+    try:
+        rollouts = _parse_capture_rollouts(value)
+    except ValueError:
+        logger.warning("Ignoring invalid VIME_NSYS_CAPTURE_ROLLOUTS=%r", value)
+        return False
+    return rollouts == "all" or rollout_id in rollouts
+
+
+def _collect_actor_train_memory_metrics() -> dict[str, float]:
+    device = torch.cuda.current_device()
+    stats = get_peak_memory_tracker("actor_train", device=device)
+    metrics_tensor = torch.tensor(
+        [
+            float(stats["alloc_before"]),
+            float(stats["reserved_before"]),
+            float(stats["alloc_after"]),
+            float(stats["reserved_after"]),
+            float(stats["peak_alloc"]),
+            float(stats["peak_reserved"]),
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    dist.all_reduce(metrics_tensor, op=dist.ReduceOp.MAX)
+    alloc_before, reserved_before, alloc_after, reserved_after, peak_alloc, peak_reserved = metrics_tensor.tolist()
+    mib = float(1024**2)
+    return {
+        "actor_train_alloc_before_mb": alloc_before / mib,
+        "actor_train_reserved_before_mb": reserved_before / mib,
+        "actor_train_alloc_after_mb": alloc_after / mib,
+        "actor_train_reserved_after_mb": reserved_after / mib,
+        "actor_train_peak_alloc_mb": peak_alloc / mib,
+        "actor_train_peak_reserved_mb": peak_reserved / mib,
+        "actor_train_peak_alloc_delta_mb": (peak_alloc - alloc_before) / mib,
+        "actor_train_peak_reserved_delta_mb": (peak_reserved - reserved_before) / mib,
+    }
+
+
+class _NsysCudaProfilerCapture:
+    def __init__(self, role: str, rollout_id: int, name: str):
+        self.role = role
+        self.rollout_id = rollout_id
+        self.name = name
+        self.enabled = _should_nsys_capture(role, rollout_id)
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStart()
+            torch.cuda.nvtx.range_push(f"{self.role}_{self.name}_rollout_{self.rollout_id}")
+            logger.info(
+                "Nsight Systems cudaProfilerStart: role=%s rollout_id=%s range=%s",
+                self.role,
+                self.rollout_id,
+                self.name,
+            )
+        except Exception:
+            logger.warning("Failed to start Nsight Systems profiler capture.", exc_info=True)
+            self.enabled = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.enabled:
+            return False
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.cudart().cudaProfilerStop()
+            logger.info(
+                "Nsight Systems cudaProfilerStop: role=%s rollout_id=%s range=%s",
+                self.role,
+                self.rollout_id,
+                self.name,
+            )
+        except Exception:
+            logger.warning("Failed to stop Nsight Systems profiler capture.", exc_info=True)
+        return False
+
+
 class MegatronTrainRayActor(TrainRayActor):
+    def _keep_train_process_groups_during_offload(self) -> bool:
+        return _env_flag("VIME_KEEP_TRAIN_PROCESS_GROUPS_DURING_OFFLOAD")
+
+    def _keep_host_cache_during_train_offload(self) -> bool:
+        return _env_flag("VIME_KEEP_HOST_CACHE_DURING_TRAIN_OFFLOAD")
+
+    def _skip_memory_clear_after_train_wake_up(self) -> bool:
+        return _env_flag("VIME_SKIP_MEMORY_CLEAR_AFTER_TRAIN_WAKE_UP")
+
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
         self,
@@ -170,7 +294,11 @@ class MegatronTrainRayActor(TrainRayActor):
     def sleep(self) -> None:
         assert self.args.offload_train
 
-        clear_memory(clear_host_memory=True)
+        keep_host_cache = self._keep_host_cache_during_train_offload()
+        if keep_host_cache:
+            logger.info("Keeping host pinned cache before train offload.")
+        # Reuse pinned host allocations for torch_memory_saver's large CPU backups.
+        clear_memory(clear_host_memory=not keep_host_cache)
         print_memory("before offload model")
         if (
             self.role == "actor"
@@ -179,7 +307,10 @@ class MegatronTrainRayActor(TrainRayActor):
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
-        destroy_process_groups()
+        if self._keep_train_process_groups_during_offload():
+            logger.info("Keeping train process groups alive during offload.")
+        else:
+            destroy_process_groups()
 
         torch_memory_saver.pause()
 
@@ -192,8 +323,13 @@ class MegatronTrainRayActor(TrainRayActor):
 
         torch_memory_saver.resume()
 
-        clear_memory()
-        reload_process_groups()
+        if self._skip_memory_clear_after_train_wake_up():
+            logger.info("Skipping gc/empty_cache after train wake_up; synchronizing only.")
+            torch.cuda.synchronize()
+        else:
+            clear_memory()
+        if not self._keep_train_process_groups_during_offload():
+            reload_process_groups()
         if self.role == "actor":
             self._switch_model("actor")
         print_memory("after wake_up model")
@@ -523,16 +659,19 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
-            with timer("actor_train"):
-                train(
-                    rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
-                    global_batch_sizes,
-                )
+            with _NsysCudaProfilerCapture(self.role, rollout_id, "actor_train"):
+                reset_peak_memory_tracker("actor_train")
+                with timer("actor_train"):
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                        global_batch_sizes,
+                    )
+            Timer().update_metrics(_collect_actor_train_memory_metrics())
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -603,7 +742,8 @@ class MegatronTrainRayActor(TrainRayActor):
         if reconnect_rollout_engines:
             self.wake_up()
         elif self.args.offload_train:
-            reload_process_groups()
+            if not self._keep_train_process_groups_during_offload():
+                reload_process_groups()
 
         if num_new_engines > 0 or reconnect_rollout_engines:
             self.weight_updater.connect_rollout_engines(
@@ -643,7 +783,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if reconnect_rollout_engines:
             self.sleep()
         elif self.args.offload_train:
-            destroy_process_groups()
+            if self._keep_train_process_groups_during_offload():
+                logger.info("Keeping train process groups alive after update_weights.")
+            else:
+                destroy_process_groups()
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune

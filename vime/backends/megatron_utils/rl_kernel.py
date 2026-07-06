@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from argparse import Namespace
 from contextlib import contextmanager
@@ -10,7 +11,10 @@ from typing import Any
 import torch
 from megatron.core import mpu
 
+from vime.utils.memory_utils import update_peak_memory_tracker
 from vime.utils.rl_kernel import is_rl_kernel_op_enabled
+
+from .cuda_event_timer import CudaEventTimerQueue
 
 logger = logging.getLogger(__name__)
 
@@ -20,13 +24,35 @@ _LINEAR_LOGP_OP = None
 _LINEAR_LOGP_OP_LOAD_ERROR: Exception | None = None
 _WARNED_FALLBACK_REASONS: set[str] = set()
 _FALLBACK_COUNTS: dict[str, int] = {"logp": 0, "linear_logp": 0}
+_LINEAR_LOGP_SAVE_PROBS_CAST_LOGGED = False
 _RUNTIME_COUNTER_KEYS = (
     "linear_logp_call_count",
     "linear_logp_token_count",
     "linear_logp_dispatch_elapsed_s",
+    "linear_logp_forward_cuda_event_count",
+    "linear_logp_forward_cuda_event_elapsed_s",
+    "linear_logp_forward_backward_cuda_event_count",
+    "linear_logp_forward_backward_cuda_event_elapsed_s",
 )
 _RUNTIME_COUNTERS: dict[str, float] = dict.fromkeys(_RUNTIME_COUNTER_KEYS, 0.0)
 _RUNTIME_COUNTER_LAST_SNAPSHOT: dict[str, float] = dict.fromkeys(_RUNTIME_COUNTER_KEYS, 0.0)
+_CUDA_EVENT_TIMER_QUEUE = CudaEventTimerQueue()
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_bool(name: str) -> bool | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean flag, got {value!r}")
 
 
 @dataclass(frozen=True)
@@ -46,12 +72,14 @@ def get_rl_kernel_fallback_count(op: str | None = None) -> int:
 
 
 def reset_rl_kernel_runtime_counters() -> None:
+    _CUDA_EVENT_TIMER_QUEUE.clear()
     for key in _RUNTIME_COUNTER_KEYS:
         _RUNTIME_COUNTERS[key] = 0.0
         _RUNTIME_COUNTER_LAST_SNAPSHOT[key] = 0.0
 
 
 def get_rl_kernel_runtime_counters() -> dict[str, float]:
+    _CUDA_EVENT_TIMER_QUEUE.flush_ready()
     return dict(_RUNTIME_COUNTERS)
 
 
@@ -68,6 +96,93 @@ def _record_linear_logp_runtime(token_count: int, elapsed_s: float) -> None:
     _RUNTIME_COUNTERS["linear_logp_call_count"] += 1.0
     _RUNTIME_COUNTERS["linear_logp_token_count"] += float(token_count)
     _RUNTIME_COUNTERS["linear_logp_dispatch_elapsed_s"] += float(elapsed_s)
+
+
+def _record_linear_logp_forward_event_runtime(elapsed_s: float) -> None:
+    _RUNTIME_COUNTERS["linear_logp_forward_cuda_event_count"] += 1.0
+    _RUNTIME_COUNTERS["linear_logp_forward_cuda_event_elapsed_s"] += float(elapsed_s)
+
+
+def _record_linear_logp_forward_backward_event_runtime(elapsed_s: float) -> None:
+    _RUNTIME_COUNTERS["linear_logp_forward_backward_cuda_event_count"] += 1.0
+    _RUNTIME_COUNTERS["linear_logp_forward_backward_cuda_event_elapsed_s"] += float(elapsed_s)
+
+
+def _cuda_event_timer_enabled(tensor: torch.Tensor) -> bool:
+    return _env_flag("VIME_RL_KERNEL_CUDA_EVENT_TIMER") and tensor.is_cuda
+
+
+def _should_detach_linear_logp_hidden(args: Namespace) -> bool:
+    override = _env_bool("VIME_RL_KERNEL_LINEAR_LOGP_DETACH_HIDDEN")
+    if override is not None:
+        return override
+
+    patterns = tuple(getattr(args, "only_train_params_name_list", ()) or ())
+    return bool(patterns) and all("output_layer" in str(pattern) for pattern in patterns)
+
+
+def _linear_logp_needs_bf16_fast_path_cast() -> bool:
+    return _env_flag("RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16") or _env_flag(
+        "RL_KERNEL_LINEAR_LOGP_FUSED_TILE_BWD_FULL"
+    )
+
+
+def _maybe_cast_hidden_for_bf16_fast_path(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    global _LINEAR_LOGP_SAVE_PROBS_CAST_LOGGED
+    if not _linear_logp_needs_bf16_fast_path_cast():
+        return hidden_states
+    if not (hidden_states.is_cuda and weight.is_cuda and hidden_states.device == weight.device):
+        return hidden_states
+    if weight.dtype != torch.bfloat16 or hidden_states.dtype == torch.bfloat16:
+        return hidden_states
+    if not hidden_states.is_floating_point():
+        return hidden_states
+
+    if not _LINEAR_LOGP_SAVE_PROBS_CAST_LOGGED:
+        logger.info(
+            "Casting RL-Kernel linear_logp hidden states from %s to bf16 "
+            "to enable bf16 fast path; hidden_requires_grad=%s.",
+            hidden_states.dtype,
+            hidden_states.requires_grad,
+        )
+        _LINEAR_LOGP_SAVE_PROBS_CAST_LOGGED = True
+    return hidden_states.to(dtype=torch.bfloat16)
+
+
+def _register_linear_logp_backward_event_timer(
+    *,
+    start_event: torch.cuda.Event,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> None:
+    watched_tensor = None
+    # In full-gradient runs, shared/tied output weights can receive other
+    # gradient contributions later in the model backward. Watch the op input
+    # first so this timer captures the linear_logp backward boundary.
+    for candidate in (hidden_states, weight, bias):
+        if isinstance(candidate, torch.Tensor) and candidate.requires_grad:
+            watched_tensor = candidate
+            break
+    if watched_tensor is None:
+        return
+
+    handle_box = {}
+
+    def _hook(grad):
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        _CUDA_EVENT_TIMER_QUEUE.enqueue(
+            start_event,
+            end_event,
+            _record_linear_logp_forward_backward_event_runtime,
+        )
+        handle = handle_box.get("handle")
+        if handle is not None:
+            handle.remove()
+        return grad
+
+    handle_box["handle"] = watched_tensor.register_hook(_hook)
 
 
 def _warn_fallback(args: Namespace, op: str, reason: str) -> None:
@@ -109,9 +224,24 @@ def _get_linear_logp_op(args: Namespace):
         return None
 
     try:
-        from rl_engine.kernels.registry import kernel_registry
+        forced_backend = os.getenv("VIME_RL_KERNEL_LINEAR_LOGP_BACKEND", "").strip().lower()
+        if forced_backend in {"triton", "triton_linear_logp"}:
+            from rl_engine.kernels.ops.triton.loss.linear_logp import TritonLinearLogpOp
 
-        _LINEAR_LOGP_OP = kernel_registry.get_op("linear_logp")
+            _LINEAR_LOGP_OP = TritonLinearLogpOp()
+        elif forced_backend in {"cuda", "sm90", "cuda_sm90", "fused_sm90"}:
+            from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
+
+            _LINEAR_LOGP_OP = FusedLinearLogpSM90Op()
+        elif forced_backend in {"", "auto", "registry"}:
+            from rl_engine.kernels.registry import kernel_registry
+
+            _LINEAR_LOGP_OP = kernel_registry.get_op("linear_logp")
+        else:
+            raise ValueError(
+                "unknown VIME_RL_KERNEL_LINEAR_LOGP_BACKEND="
+                f"{forced_backend!r}; expected triton, cuda, or registry"
+            )
         logger.info("Using RL-Kernel linear_logp op: %s", type(_LINEAR_LOGP_OP).__name__)
         return _LINEAR_LOGP_OP
     except Exception as exc:  # pragma: no cover - exercised with missing optional package in integration envs
@@ -143,6 +273,16 @@ def _is_pipeline_last_stage_for_model(model) -> bool:
 
 
 def _get_lm_head_weight(model, output_layer) -> torch.Tensor | None:
+    if getattr(model, "share_embeddings_and_output_weights", False):
+        shared_weight = getattr(model, "shared_embedding_or_output_weight", None)
+        if callable(shared_weight):
+            try:
+                weight = shared_weight()
+                if isinstance(weight, torch.Tensor):
+                    return weight
+            except Exception:
+                logger.debug("Unable to read shared embedding/output weight for RL-Kernel linear_logp.", exc_info=True)
+
     weight = getattr(output_layer, "weight", None)
     if isinstance(weight, torch.Tensor):
         return weight
@@ -334,8 +474,24 @@ def maybe_compute_linear_logp(
         weight = weight / rollout_temperature
         if bias is not None:
             bias = bias / rollout_temperature
+    if _should_detach_linear_logp_hidden(args):
+        hidden_states = hidden_states.detach()
+    hidden_states = _maybe_cast_hidden_for_bf16_fast_path(hidden_states, weight)
 
     start_s = time.perf_counter()
+    event_timer = _cuda_event_timer_enabled(hidden_states)
+    forward_start_event = None
+    if event_timer:
+        forward_start_event = torch.cuda.Event(enable_timing=True)
+        forward_start_event.record()
+    memory_probe = _env_flag("VIME_LINEAR_LOGP_MEMORY_PROBE") and hidden_states.is_cuda
+    if memory_probe:
+        probe_device = hidden_states.device
+        torch.cuda.synchronize(probe_device)
+        probe_before_alloc = torch.cuda.memory_allocated(probe_device)
+        probe_before_reserved = torch.cuda.memory_reserved(probe_device)
+        update_peak_memory_tracker("actor_train", device=probe_device)
+        torch.cuda.reset_peak_memory_stats(probe_device)
     try:
         log_prob = op(
             hidden_states,
@@ -351,4 +507,49 @@ def maybe_compute_linear_logp(
         return None
 
     _record_linear_logp_runtime(target_ids.numel(), time.perf_counter() - start_s)
+
+    if event_timer and forward_start_event is not None:
+        forward_end_event = torch.cuda.Event(enable_timing=True)
+        forward_end_event.record()
+        _CUDA_EVENT_TIMER_QUEUE.enqueue(
+            forward_start_event,
+            forward_end_event,
+            _record_linear_logp_forward_event_runtime,
+        )
+        if log_prob.requires_grad:
+            _register_linear_logp_backward_event_timer(
+                start_event=forward_start_event,
+                hidden_states=hidden_states,
+                weight=weight,
+                bias=bias,
+            )
+
+    if memory_probe:
+        torch.cuda.synchronize(probe_device)
+        probe_after_alloc = torch.cuda.memory_allocated(probe_device)
+        probe_after_reserved = torch.cuda.memory_reserved(probe_device)
+        probe_peak_alloc = torch.cuda.max_memory_allocated(probe_device)
+        probe_peak_reserved = torch.cuda.max_memory_reserved(probe_device)
+        update_peak_memory_tracker(
+            "actor_train",
+            peak_alloc=probe_peak_alloc,
+            peak_reserved=probe_peak_reserved,
+            device=probe_device,
+        )
+        logger.info(
+            "RL-Kernel linear_logp memory_probe: op=%s hidden_shape=%s weight_shape=%s "
+            "tokens=%d alloc_before_mb=%.2f peak_alloc_mb=%.2f peak_delta_mb=%.2f "
+            "alloc_after_mb=%.2f reserved_before_mb=%.2f reserved_after_mb=%.2f",
+            type(op).__name__,
+            tuple(hidden_states.shape),
+            tuple(weight.shape),
+            int(target_ids.numel()),
+            probe_before_alloc / (1024**2),
+            probe_peak_alloc / (1024**2),
+            (probe_peak_alloc - probe_before_alloc) / (1024**2),
+            probe_after_alloc / (1024**2),
+            probe_before_reserved / (1024**2),
+            probe_after_reserved / (1024**2),
+        )
+
     return log_prob.float().reshape(-1)

@@ -45,6 +45,8 @@ class _FakeLinearLogpOp:
                 "target_shape": tuple(target_ids.shape),
                 "bias": bias is not None,
                 "kwargs": kwargs,
+                "hidden_requires_grad": hidden.requires_grad,
+                "hidden_dtype": hidden.dtype,
             }
         )
         logits = F.linear(hidden.float(), weight.float(), None if bias is None else bias.float())
@@ -68,6 +70,7 @@ def _reset_rl_kernel_state():
     rlk_mod._LOGP_OP_LOAD_ERROR = None
     rlk_mod._LINEAR_LOGP_OP = None
     rlk_mod._LINEAR_LOGP_OP_LOAD_ERROR = None
+    rlk_mod._LINEAR_LOGP_SAVE_PROBS_CAST_LOGGED = False
     rlk_mod._WARNED_FALLBACK_REASONS.clear()
     rlk_mod._FALLBACK_COUNTS.clear()
     rlk_mod._FALLBACK_COUNTS.update({"logp": 0, "linear_logp": 0})
@@ -181,6 +184,7 @@ def test_maybe_compute_linear_logp_passes_tensor_parallel_metadata(monkeypatch):
                 "vocab_start_index": 16,
                 "global_vocab_size": 32,
             },
+            "hidden_requires_grad": False,
         }
     ]
     counters = rlk_mod.get_rl_kernel_runtime_counters()
@@ -211,6 +215,20 @@ def test_linear_logp_runtime_counter_delta_tracks_since_last_read(monkeypatch):
     assert second_delta["linear_logp_token_count"] == 2.0
     assert totals["linear_logp_call_count"] == 2.0
     assert totals["linear_logp_token_count"] == 4.0
+
+
+@pytest.mark.unit
+def test_linear_logp_detaches_hidden_for_output_layer_only_training(monkeypatch):
+    _install_fake_rl_engine(monkeypatch)
+    args = _make_args(only_train_params_name_list=("output_layer",))
+    hidden = torch.randn(4, 3, requires_grad=True)
+    weight = torch.randn(5, 3, requires_grad=True)
+    target = torch.randint(0, 5, (4,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None)
+
+    rlk_mod.maybe_compute_linear_logp(hidden, target, context=context, args=args, with_entropy=False)
+
+    assert _FakeLinearLogpOp.calls[-1]["hidden_requires_grad"] is False
 
 
 @pytest.mark.unit
@@ -437,7 +455,7 @@ def test_return_hidden_states_for_linear_logp_restores_post_process_flag():
 
 
 @pytest.mark.unit
-def test_policy_loss_only_skips_entropy_when_linear_logp_context_is_active():
+def test_policy_loss_only_skips_entropy_when_linear_logp_context_is_active(monkeypatch):
     args = _make_args(enable_rl_kernel=True, rl_kernel_ops=("linear_logp",), entropy_coef=0.0)
     context = rlk_mod.LinearLogpContext(
         lm_head_weight=torch.empty(4, 3),
@@ -445,8 +463,14 @@ def test_policy_loss_only_skips_entropy_when_linear_logp_context_is_active():
         tp_group=None,
     )
 
+    monkeypatch.delenv("VIME_SKIP_ZERO_ENTROPY_METRIC", raising=False)
     assert loss_mod._policy_loss_needs_entropy(args, None) is True
     assert loss_mod._policy_loss_needs_entropy(args, context) is False
 
+    monkeypatch.setenv("VIME_SKIP_ZERO_ENTROPY_METRIC", "1")
+    assert loss_mod._policy_loss_needs_entropy(args, None) is False
+    assert loss_mod._policy_loss_needs_entropy(args, context) is False
+
     args.entropy_coef = 0.01
+    assert loss_mod._policy_loss_needs_entropy(args, None) is True
     assert loss_mod._policy_loss_needs_entropy(args, context) is True

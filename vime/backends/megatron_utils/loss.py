@@ -1,3 +1,6 @@
+import logging
+import os
+import time
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -8,6 +11,7 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
+from vime.utils.memory_utils import update_peak_memory_tracker
 from vime.utils.distributed_utils import distributed_masked_whiten
 from vime.utils.misc import load_function
 from vime.utils.ppo_utils import (
@@ -23,6 +27,12 @@ from vime.utils.ppo_utils import (
 )
 from vime.utils.types import RolloutBatch
 
+from .baseline_timer import (
+    baseline_cuda_event_timer_enabled,
+    baseline_linear_logp_timer_enabled,
+    queue_baseline_native_logprob_cuda_event,
+    record_baseline_native_logprob_runtime,
+)
 from .cp_utils import (
     all_gather_with_cp,
     get_logits_and_tokens_offset_with_cp,
@@ -30,6 +40,12 @@ from .cp_utils import (
     slice_log_prob_with_cp,
 )
 from .rl_kernel import LinearLogpContext, get_rl_kernel_fallback_count, maybe_compute_linear_logp, maybe_compute_logp
+
+logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_responses(
@@ -434,6 +450,11 @@ def _policy_loss_needs_entropy(
     args: Namespace,
     rl_kernel_linear_logp_context: LinearLogpContext | None,
 ) -> bool:
+    if (
+        getattr(args, "entropy_coef", 0.0) == 0
+        and _env_flag("VIME_SKIP_ZERO_ENTROPY_METRIC")
+    ):
+        return False
     if rl_kernel_linear_logp_context is None:
         return True
     return not (
@@ -514,7 +535,33 @@ def get_log_probs_and_entropy(
     else:
         log_prob_full = maybe_compute_logp(logits, full_tokens, args=args, with_entropy=with_entropy)
 
+    native_memory_probe = (
+        log_prob_full is None
+        and linear_logp_context is None
+        and _env_flag("VIME_LINEAR_LOGP_MEMORY_PROBE")
+        and logits.is_cuda
+    )
+    if native_memory_probe:
+        probe_device = logits.device
+        torch.cuda.synchronize(probe_device)
+        probe_before_alloc = torch.cuda.memory_allocated(probe_device)
+        probe_before_reserved = torch.cuda.memory_reserved(probe_device)
+        update_peak_memory_tracker("actor_train", device=probe_device)
+        torch.cuda.reset_peak_memory_stats(probe_device)
+        probe_start_s = time.perf_counter()
+
     if log_prob_full is None:
+        native_runtime_timer = linear_logp_context is None and baseline_linear_logp_timer_enabled(args)
+        native_timer_start_s = time.perf_counter() if native_runtime_timer else None
+        native_event_timer = (
+            linear_logp_context is None
+            and baseline_cuda_event_timer_enabled(args)
+            and logits.is_cuda
+        )
+        native_event_start = None
+        if native_event_timer:
+            native_event_start = torch.cuda.Event(enable_timing=True)
+            native_event_start.record()
         log_prob_full, entropy_full = calculate_log_probs_and_entropy(
             logits,
             full_tokens,
@@ -522,8 +569,47 @@ def get_log_probs_and_entropy(
             with_entropy=with_entropy,
             chunk_size=chunk_size,
         )
+        if native_timer_start_s is not None:
+            record_baseline_native_logprob_runtime(full_tokens.numel(), time.perf_counter() - native_timer_start_s)
+        if native_event_start is not None:
+            native_event_end = torch.cuda.Event(enable_timing=True)
+            native_event_end.record()
+            queue_baseline_native_logprob_cuda_event(
+                native_event_start,
+                native_event_end,
+            )
     else:
         entropy_full = None
+
+    if native_memory_probe:
+        torch.cuda.synchronize(probe_device)
+        probe_after_alloc = torch.cuda.memory_allocated(probe_device)
+        probe_after_reserved = torch.cuda.memory_reserved(probe_device)
+        probe_peak_alloc = torch.cuda.max_memory_allocated(probe_device)
+        probe_peak_reserved = torch.cuda.max_memory_reserved(probe_device)
+        update_peak_memory_tracker(
+            "actor_train",
+            peak_alloc=probe_peak_alloc,
+            peak_reserved=probe_peak_reserved,
+            device=probe_device,
+        )
+        logger.info(
+            "Baseline native_logprob memory_probe: op=calculate_log_probs_and_entropy "
+            "logits_shape=%s tokens=%d with_entropy=%s alloc_before_mb=%.2f "
+            "peak_alloc_mb=%.2f peak_delta_mb=%.2f alloc_after_mb=%.2f "
+            "alloc_after_delta_mb=%.2f reserved_before_mb=%.2f reserved_after_mb=%.2f elapsed_s=%.6f",
+            tuple(logits.shape),
+            int(full_tokens.numel()),
+            bool(with_entropy),
+            probe_before_alloc / (1024**2),
+            probe_peak_alloc / (1024**2),
+            (probe_peak_alloc - probe_before_alloc) / (1024**2),
+            probe_after_alloc / (1024**2),
+            (probe_after_alloc - probe_before_alloc) / (1024**2),
+            probe_before_reserved / (1024**2),
+            probe_after_reserved / (1024**2),
+            time.perf_counter() - probe_start_s,
+        )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
     # --- extract per-sample response portions ---

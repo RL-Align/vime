@@ -1,5 +1,6 @@
 import ast
 import logging
+import os
 
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
@@ -146,7 +147,7 @@ def _hf_validate_args(args, hf_config):
 
 def _set_default_megatron_args(args):
     # always use zero optimizer
-    args.use_distributed_optimizer = True
+    args.use_distributed_optimizer = os.environ.get("VIME_USE_DISTRIBUTED_OPTIMIZER", "1") != "0"
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
     # placeholders

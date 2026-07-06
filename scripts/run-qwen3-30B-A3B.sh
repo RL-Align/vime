@@ -1,20 +1,53 @@
 #!/bin/bash
 
+WORKSPACE_ROOT=${WORKSPACE_ROOT:-/workspace}
+VIME_PYTHON_ENV=${VIME_PYTHON_ENV:-${WORKSPACE_ROOT}/vime-rlk-env}
+if [[ -d "${VIME_PYTHON_ENV}/bin" ]]; then
+   export PATH="${VIME_PYTHON_ENV}/bin:${PATH}"
+fi
+
 # for rerun the task
-pkill -9 -f "vllm serve"
-sleep 3
-ray stop --force
-pkill -9 ray
-pkill -9 python
-sleep 3
-pkill -9 ray
-pkill -9 python
-pkill -9 redis
+if [[ "${VIME_SKIP_PROCESS_CLEANUP:-0}" != "1" ]]; then
+   pkill -9 -f "vllm serve"
+   sleep 3
+   ray stop --force
+   pkill -9 ray
+   pkill -9 python
+   sleep 3
+   pkill -9 ray
+   pkill -9 python
+   pkill -9 redis
+fi
 
 set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256}"
+export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
+if [[ -z "${CUDA_HOME:-}" ]]; then
+   if [[ -d "${VIME_PYTHON_ENV}/lib/python3.11/site-packages/nvidia/cu13" ]]; then
+      export CUDA_HOME="${VIME_PYTHON_ENV}/lib/python3.11/site-packages/nvidia/cu13"
+   elif [[ -d /usr/local/lib/python3.11/dist-packages/nvidia/cu13 ]]; then
+      export CUDA_HOME=/usr/local/lib/python3.11/dist-packages/nvidia/cu13
+   else
+      export CUDA_HOME=/usr/local/cuda
+   fi
+fi
+export PATH="${CUDA_HOME}/bin:${PATH}"
+if [[ -d "${VIME_PYTHON_ENV}/lib/python3.11/site-packages/nvidia/cudnn" ]]; then
+   CUDNN_HOME="${VIME_PYTHON_ENV}/lib/python3.11/site-packages/nvidia/cudnn"
+else
+   CUDNN_HOME="/usr/local/lib/python3.11/dist-packages/nvidia/cudnn"
+fi
+TORCH_LIB_DIR="${VIME_PYTHON_ENV}/lib/python3.11/site-packages/torch/lib"
+if [[ -d "${TORCH_LIB_DIR}" ]]; then
+   export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDNN_HOME}/lib:${LD_LIBRARY_PATH:-}"
+else
+   export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDNN_HOME}/lib:${LD_LIBRARY_PATH:-}"
+fi
+export CPATH="${CUDA_HOME}/include:${CUDNN_HOME}/include:${CPATH:-}"
+export LIBRARY_PATH="${CUDA_HOME}/lib:${CUDA_HOME}/lib64:${CUDNN_HOME}/lib:${LIBRARY_PATH:-}"
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -22,7 +55,11 @@ if [ "$NVLINK_COUNT" -gt 0 ]; then
 else
     HAS_NVLINK=0
 fi
+NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
+NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE:-0}
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
+echo "NCCL_NVLS_ENABLE: $NCCL_NVLS_ENABLE"
+echo "NCCL_CUMEM_ENABLE: $NCCL_CUMEM_ENABLE"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
     DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')
@@ -70,6 +107,12 @@ echo "NUM_GPUS: $NUM_GPUS"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 VIME_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+MEGATRON_ROOT=${MEGATRON_ROOT:-${WORKSPACE_ROOT}/Megatron-LM}
+QWEN3_30B_A3B_HF_DIR=${QWEN3_30B_A3B_HF_DIR:-${WORKSPACE_ROOT}/Qwen3-30B-A3B}
+QWEN3_30B_A3B_TORCH_DIST_DIR=${QWEN3_30B_A3B_TORCH_DIST_DIR:-${WORKSPACE_ROOT}/Qwen3-30B-A3B_torch_dist}
+DAPO_MATH_17K_DIR=${DAPO_MATH_17K_DIR:-${WORKSPACE_ROOT}/dapo-math-17k}
+AIME_2024_DIR=${AIME_2024_DIR:-${WORKSPACE_ROOT}/aime-2024}
+VIME_NO_MOE_PERMUTE_FUSION=${VIME_NO_MOE_PERMUTE_FUSION:-1}
 source "${SCRIPT_DIR}/models/qwen3-30B-A3B.sh"
 
 MEGATRON_TP=${MEGATRON_TP:-2}
@@ -83,11 +126,40 @@ ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-1024}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
 ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-${NUM_GPUS}}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.5}
-VIME_CKPT_DIR=${VIME_CKPT_DIR:-/root/Qwen3-30B-A3B_vime_tp2_dev}
+VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-}
+VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-}
+VIME_CKPT_DIR=${VIME_CKPT_DIR:-${WORKSPACE_ROOT}/Qwen3-30B-A3B_vime_tp2_dev}
 VIME_DISABLE_SAVE=${VIME_DISABLE_SAVE:-1}
 VIME_SKIP_EVAL_BEFORE_TRAIN=${VIME_SKIP_EVAL_BEFORE_TRAIN:-1}
 VIME_VLLM_ENFORCE_EAGER=${VIME_VLLM_ENFORCE_EAGER:-1}
+VIME_LOAD_DEBUG_ROLLOUT_DATA=${VIME_LOAD_DEBUG_ROLLOUT_DATA:-}
 VIME_NO_GRAD_ACCUM_FUSION=${VIME_NO_GRAD_ACCUM_FUSION:-1}
+VIME_NO_MASKED_SOFTMAX_FUSION=${VIME_NO_MASKED_SOFTMAX_FUSION:-1}
+VIME_TRANSFORMER_IMPL=${VIME_TRANSFORMER_IMPL:-local}
+VIME_NO_ROPE_FUSION=${VIME_NO_ROPE_FUSION:-1}
+VIME_NO_PERSIST_LAYER_NORM=${VIME_NO_PERSIST_LAYER_NORM:-1}
+VIME_SEQUENCE_PARALLEL=${VIME_SEQUENCE_PARALLEL:-0}
+MEGATRON_ALLOW_MOE_TP_WITHOUT_SP=${MEGATRON_ALLOW_MOE_TP_WITHOUT_SP:-0}
+VIME_USE_DISTRIBUTED_OPTIMIZER=${VIME_USE_DISTRIBUTED_OPTIMIZER:-1}
+VIME_USE_PRECISION_AWARE_OPTIMIZER=${VIME_USE_PRECISION_AWARE_OPTIMIZER:-1}
+VIME_OPTIMIZER_CPU_OFFLOAD=${VIME_OPTIMIZER_CPU_OFFLOAD:-1}
+VIME_USE_FP32_GRAD_BUFFER=${VIME_USE_FP32_GRAD_BUFFER:-1}
+VIME_GRAD_REDUCE_IN_BF16=${VIME_GRAD_REDUCE_IN_BF16:-0}
+VIME_TRAIN_MEMORY_MARGIN_BYTES=${VIME_TRAIN_MEMORY_MARGIN_BYTES:-1073741824}
+VIME_DDP_BUCKET_SIZE=${VIME_DDP_BUCKET_SIZE:-}
+VIME_DDP_NUM_BUCKETS=${VIME_DDP_NUM_BUCKETS:-}
+VIME_ONLY_TRAIN_PARAMS_NAME_LIST=${VIME_ONLY_TRAIN_PARAMS_NAME_LIST:-}
+VIME_SYNC_TRAINABLE_WEIGHTS_ONLY=${VIME_SYNC_TRAINABLE_WEIGHTS_ONLY:-0}
+VIME_USE_KL_LOSS=${VIME_USE_KL_LOSS:-1}
+VIME_USE_ROLLOUT_LOGPROBS=${VIME_USE_ROLLOUT_LOGPROBS:-0}
+if [[ "${VIME_RL_KERNEL:-0}" == "1" ]]; then
+   VIME_RL_KERNEL_LINEAR_LOGP_BACKEND=${VIME_RL_KERNEL_LINEAR_LOGP_BACKEND:-cuda}
+   VIME_RL_KERNEL_CUDA_EVENT_TIMER=${VIME_RL_KERNEL_CUDA_EVENT_TIMER:-1}
+   RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16=${RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16:-1}
+   if [[ -z "${VIME_RL_KERNEL_LINEAR_LOGP_DETACH_HIDDEN:-}" && "${VIME_ONLY_TRAIN_PARAMS_NAME_LIST}" == *"output_layer"* ]]; then
+      VIME_RL_KERNEL_LINEAR_LOGP_DETACH_HIDDEN=1
+   fi
+fi
 
 validate_positive_int "MEGATRON_TP" "$MEGATRON_TP"
 validate_positive_int "MEGATRON_EP" "$MEGATRON_EP"
@@ -99,6 +171,12 @@ validate_positive_int "N_SAMPLES_PER_PROMPT" "$N_SAMPLES_PER_PROMPT"
 validate_positive_int "ROLLOUT_MAX_RESPONSE_LEN" "$ROLLOUT_MAX_RESPONSE_LEN"
 validate_positive_int "GLOBAL_BATCH_SIZE" "$GLOBAL_BATCH_SIZE"
 validate_positive_int "ROLLOUT_NUM_GPUS_PER_ENGINE" "$ROLLOUT_NUM_GPUS_PER_ENGINE"
+if [[ -n "${VLLM_MAX_MODEL_LEN}" ]]; then
+   validate_positive_int "VLLM_MAX_MODEL_LEN" "$VLLM_MAX_MODEL_LEN"
+fi
+if [[ -n "${VLLM_MAX_NUM_SEQS}" ]]; then
+   validate_positive_int "VLLM_MAX_NUM_SEQS" "$VLLM_MAX_NUM_SEQS"
+fi
 validate_at_most_num_gpus "MEGATRON_TP" "$MEGATRON_TP"
 validate_at_most_num_gpus "MEGATRON_EP" "$MEGATRON_EP"
 validate_at_most_num_gpus "ROLLOUT_NUM_GPUS_PER_ENGINE" "$ROLLOUT_NUM_GPUS_PER_ENGINE"
@@ -117,12 +195,36 @@ echo "GLOBAL_BATCH_SIZE: $GLOBAL_BATCH_SIZE"
 echo "MAX_TOKENS_PER_GPU: $MAX_TOKENS_PER_GPU"
 echo "ROLLOUT_MAX_RESPONSE_LEN: $ROLLOUT_MAX_RESPONSE_LEN"
 echo "VLLM_GPU_MEMORY_UTILIZATION: $VLLM_GPU_MEMORY_UTILIZATION"
+echo "VLLM_MAX_MODEL_LEN: ${VLLM_MAX_MODEL_LEN:-<unset>}"
+echo "VLLM_MAX_NUM_SEQS: ${VLLM_MAX_NUM_SEQS:-<unset>}"
+echo "WORKSPACE_ROOT: $WORKSPACE_ROOT"
+echo "MEGATRON_ROOT: $MEGATRON_ROOT"
+echo "QWEN3_30B_A3B_HF_DIR: $QWEN3_30B_A3B_HF_DIR"
+echo "QWEN3_30B_A3B_TORCH_DIST_DIR: $QWEN3_30B_A3B_TORCH_DIST_DIR"
+echo "DAPO_MATH_17K_DIR: $DAPO_MATH_17K_DIR"
+echo "AIME_2024_DIR: $AIME_2024_DIR"
 echo "VIME_CKPT_DIR: $VIME_CKPT_DIR"
+echo "VIME_LOAD_DEBUG_ROLLOUT_DATA: ${VIME_LOAD_DEBUG_ROLLOUT_DATA:-<unset>}"
+echo "VIME_USE_DISTRIBUTED_OPTIMIZER: $VIME_USE_DISTRIBUTED_OPTIMIZER"
+echo "VIME_USE_PRECISION_AWARE_OPTIMIZER: $VIME_USE_PRECISION_AWARE_OPTIMIZER"
+echo "VIME_OPTIMIZER_CPU_OFFLOAD: $VIME_OPTIMIZER_CPU_OFFLOAD"
+echo "VIME_USE_FP32_GRAD_BUFFER: $VIME_USE_FP32_GRAD_BUFFER"
+echo "VIME_GRAD_REDUCE_IN_BF16: $VIME_GRAD_REDUCE_IN_BF16"
+echo "VIME_TRAIN_MEMORY_MARGIN_BYTES: $VIME_TRAIN_MEMORY_MARGIN_BYTES"
+echo "VIME_TRANSFORMER_IMPL: $VIME_TRANSFORMER_IMPL"
+echo "VIME_ONLY_TRAIN_PARAMS_NAME_LIST: ${VIME_ONLY_TRAIN_PARAMS_NAME_LIST:-<unset>}"
+echo "VIME_SYNC_TRAINABLE_WEIGHTS_ONLY: $VIME_SYNC_TRAINABLE_WEIGHTS_ONLY"
+echo "VIME_USE_KL_LOSS: $VIME_USE_KL_LOSS"
+echo "VIME_USE_ROLLOUT_LOGPROBS: $VIME_USE_ROLLOUT_LOGPROBS"
+echo "VIME_RL_KERNEL_LINEAR_LOGP_BACKEND: ${VIME_RL_KERNEL_LINEAR_LOGP_BACKEND:-<unset>}"
+echo "VIME_RL_KERNEL_CUDA_EVENT_TIMER: ${VIME_RL_KERNEL_CUDA_EVENT_TIMER:-<unset>}"
+echo "VIME_RL_KERNEL_LINEAR_LOGP_DETACH_HIDDEN: ${VIME_RL_KERNEL_LINEAR_LOGP_DETACH_HIDDEN:-<auto>}"
+echo "RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16: ${RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16:-<unset>}"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen3-30B-A3B
+   --hf-checkpoint "${QWEN3_30B_A3B_HF_DIR}"
    #--hf-checkpoint /root/Qwen3-30B-A3B-FP8
-   --ref-load /root/Qwen3-30B-A3B_torch_dist
+   --ref-load "${QWEN3_30B_A3B_TORCH_DIST_DIR}"
    --load "${VIME_CKPT_DIR}/"
 )
 if [[ "${VIME_DISABLE_SAVE:-0}" != "1" ]]; then
@@ -133,7 +235,7 @@ if [[ "${VIME_DISABLE_SAVE:-0}" != "1" ]]; then
 fi
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
+   --prompt-data "${DAPO_MATH_17K_DIR}/dapo-math-17k.jsonl"
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -151,7 +253,7 @@ ROLLOUT_ARGS=(
 
 EVAL_ARGS=(
    --eval-interval 20
-   --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
+   --eval-prompt-data aime "${AIME_2024_DIR}/aime-2024.jsonl"
    --n-samples-per-eval-prompt 16
    --eval-max-response-len 16384
    --eval-top-p 1
@@ -162,7 +264,6 @@ fi
 
 PERF_ARGS=(
    --tensor-model-parallel-size "${MEGATRON_TP}"
-   --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size "${MEGATRON_CP}"
    --expert-model-parallel-size "${MEGATRON_EP}"
@@ -176,19 +277,34 @@ PERF_ARGS=(
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 )
+if [[ "${VIME_SEQUENCE_PARALLEL:-0}" == "1" ]]; then
+   PERF_ARGS+=(--sequence-parallel)
+fi
 if [[ "${VIME_NO_GRAD_ACCUM_FUSION:-0}" == "1" ]]; then
    PERF_ARGS+=(--no-gradient-accumulation-fusion)
+fi
+if [[ "${VIME_NO_MASKED_SOFTMAX_FUSION:-0}" == "1" ]]; then
+   PERF_ARGS+=(--no-masked-softmax-fusion)
+fi
+PERF_ARGS+=(--transformer-impl "${VIME_TRANSFORMER_IMPL}")
+if [[ "${VIME_NO_ROPE_FUSION:-0}" == "1" ]]; then
+   PERF_ARGS+=(--no-rope-fusion)
+fi
+if [[ "${VIME_NO_PERSIST_LAYER_NORM:-0}" == "1" ]]; then
+   PERF_ARGS+=(--no-persist-layer-norm)
 fi
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
 )
+if [[ "${VIME_USE_KL_LOSS:-1}" == "1" ]]; then
+   GRPO_ARGS+=(--use-kl-loss)
+fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam
@@ -197,11 +313,13 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
-
-   --optimizer-cpu-offload
-   --overlap-cpu-optimizer-d2h-h2d
-   --use-precision-aware-optimizer
 )
+if [[ "${VIME_OPTIMIZER_CPU_OFFLOAD:-1}" == "1" ]]; then
+   OPTIMIZER_ARGS+=(--optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d)
+fi
+if [[ "${VIME_USE_PRECISION_AWARE_OPTIMIZER:-1}" == "1" ]]; then
+   OPTIMIZER_ARGS+=(--use-precision-aware-optimizer)
+fi
 
 WANDB_ARGS=(
    #--use-wandb
@@ -223,6 +341,12 @@ VLLM_ARGS=(
    --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}"
    --vllm-enable-expert-parallel
 )
+if [[ -n "${VLLM_MAX_MODEL_LEN}" ]]; then
+   VLLM_ARGS+=(--vllm-max-model-len "${VLLM_MAX_MODEL_LEN}")
+fi
+if [[ -n "${VLLM_MAX_NUM_SEQS}" ]]; then
+   VLLM_ARGS+=(--vllm-max-num-seqs "${VLLM_MAX_NUM_SEQS}")
+fi
 if [[ "${VIME_VLLM_ENFORCE_EAGER:-0}" == "1" ]]; then
    VLLM_ARGS+=(--vllm-enforce-eager)
 else
@@ -233,12 +357,38 @@ MISC_ARGS=(
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
    --hidden-dropout 0.0
-   # should be good for model performance
-   --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
+   --train-memory-margin-bytes "${VIME_TRAIN_MEMORY_MARGIN_BYTES}"
    # need to comment this when using model with MLA
    --attention-backend flash
 )
+if [[ "${VIME_USE_FP32_GRAD_BUFFER:-1}" == "1" ]]; then
+   MISC_ARGS+=(--accumulate-allreduce-grads-in-fp32)
+fi
+if [[ "${VIME_GRAD_REDUCE_IN_BF16:-0}" == "1" ]]; then
+   MISC_ARGS+=(--grad-reduce-in-bf16)
+fi
+if [[ "${VIME_USE_ROLLOUT_LOGPROBS:-0}" == "1" ]]; then
+   MISC_ARGS+=(--use-rollout-logprobs)
+fi
+if [[ -n "${VIME_DDP_BUCKET_SIZE}" ]]; then
+   MISC_ARGS+=(--ddp-bucket-size "${VIME_DDP_BUCKET_SIZE}")
+fi
+if [[ -n "${VIME_DDP_NUM_BUCKETS}" ]]; then
+   MISC_ARGS+=(--ddp-num-buckets "${VIME_DDP_NUM_BUCKETS}")
+fi
+if [[ -n "${VIME_LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
+   MISC_ARGS+=(--load-debug-rollout-data "${VIME_LOAD_DEBUG_ROLLOUT_DATA}")
+fi
+if [[ -n "${VIME_ONLY_TRAIN_PARAMS_NAME_LIST}" ]]; then
+   IFS=',' read -ra _ONLY_TRAIN_PATTERNS <<< "${VIME_ONLY_TRAIN_PARAMS_NAME_LIST}"
+   MISC_ARGS+=(--only-train-params-name-list)
+   for _pattern in "${_ONLY_TRAIN_PATTERNS[@]}"; do
+      if [[ -n "${_pattern}" ]]; then
+         MISC_ARGS+=("${_pattern}")
+      fi
+   done
+fi
 
 RLK_ARGS=()
 if [[ "${VIME_RL_KERNEL:-0}" == "1" ]]; then
@@ -250,19 +400,38 @@ fi
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+cd "${VIME_ROOT}"
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"${VIME_ROOT}:/root/Megatron-LM/\",
+    \"PYTHONPATH\": \"${VIME_ROOT}:${MEGATRON_ROOT}\",
     \"PATH\": \"${PATH}\",
     \"CUDA_HOME\": \"${CUDA_HOME:-}\",
     \"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH:-}\",
     \"CPATH\": \"${CPATH:-}\",
     \"LIBRARY_PATH\": \"${LIBRARY_PATH:-}\",
+    \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
+    \"CUDA_MODULE_LOADING\": \"${CUDA_MODULE_LOADING}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"NCCL_NVLS_ENABLE\": \"${NCCL_NVLS_ENABLE}\",
+    \"NCCL_CUMEM_ENABLE\": \"${NCCL_CUMEM_ENABLE}\",
+    \"VIME_USE_DISTRIBUTED_OPTIMIZER\": \"${VIME_USE_DISTRIBUTED_OPTIMIZER}\",
+    \"VIME_CPU_MOE_CKPT_MERGE\": \"${VIME_CPU_MOE_CKPT_MERGE:-1}\",
+    \"VIME_SYNC_TRAINABLE_WEIGHTS_ONLY\": \"${VIME_SYNC_TRAINABLE_WEIGHTS_ONLY}\",
+    \"VIME_RL_KERNEL_LINEAR_LOGP_BACKEND\": \"${VIME_RL_KERNEL_LINEAR_LOGP_BACKEND:-}\",
+    \"VIME_RL_KERNEL_CUDA_EVENT_TIMER\": \"${VIME_RL_KERNEL_CUDA_EVENT_TIMER:-0}\",
+    \"VIME_RL_KERNEL_LINEAR_LOGP_DETACH_HIDDEN\": \"${VIME_RL_KERNEL_LINEAR_LOGP_DETACH_HIDDEN:-}\",
+    \"VIME_RL_KERNEL_VALIDATE_TP_TARGETS\": \"${VIME_RL_KERNEL_VALIDATE_TP_TARGETS:-0}\",
+    \"RL_KERNEL_LINEAR_LOGP_FUSED_BACKWARD\": \"${RL_KERNEL_LINEAR_LOGP_FUSED_BACKWARD:-1}\",
+    \"RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16\": \"${RL_KERNEL_LINEAR_LOGP_SAVE_PROBS_BF16:-0}\",
+    \"RL_KERNEL_LINEAR_LOGP_VALIDATE_TP_TARGETS\": \"${RL_KERNEL_LINEAR_LOGP_VALIDATE_TP_TARGETS:-0}\",
+    \"VIME_LINEAR_LOGP_MEMORY_PROBE\": \"${VIME_LINEAR_LOGP_MEMORY_PROBE:-0}\",
+    \"VIME_BASELINE_LINEAR_LOGP_TIMER\": \"${VIME_BASELINE_LINEAR_LOGP_TIMER:-0}\",
+    \"VIME_BASELINE_CUDA_EVENT_TIMER\": \"${VIME_BASELINE_CUDA_EVENT_TIMER:-0}\",
+    \"MEGATRON_LOCAL_ATTENTION_SINGLE_PACKED_SEQ\": \"${MEGATRON_LOCAL_ATTENTION_SINGLE_PACKED_SEQ:-0}\",
+    \"MEGATRON_ALLOW_MOE_TP_WITHOUT_SP\": \"${MEGATRON_ALLOW_MOE_TP_WITHOUT_SP}\",
     \"TENSORBOARD_DIR\": \"${TENSORBOARD_DIR:-}\"
   }
 }"
