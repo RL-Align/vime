@@ -348,6 +348,27 @@ def test_finish_weight_update_posts_empty_body(vllm_engine, monkeypatch):
 
 
 @pytest.mark.unit
+def test_vllm_profile_endpoints_return_plain_dict(vllm_engine, monkeypatch):
+    seen: list[str] = []
+
+    def fake_post(url, *, json=None, timeout=30, params=None):
+        seen.append(url)
+        assert json == {}
+        assert timeout == 30
+        assert params is None
+        return _MockResponse(text="")
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    assert vllm_engine.start_profile() == {"ok": True}
+    assert vllm_engine.stop_profile() == {"ok": True}
+    assert seen == [
+        "http://127.0.0.1:8765/start_profile",
+        "http://127.0.0.1:8765/stop_profile",
+    ]
+
+
+@pytest.mark.unit
 def test_update_weights_from_tensor_posts_ipc_payload_and_records_version(vllm_engine, monkeypatch):
     posted: list[tuple[str, dict]] = []
 

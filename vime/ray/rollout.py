@@ -2,6 +2,7 @@ import dataclasses
 import itertools
 import logging
 import multiprocessing
+import os
 import random
 import time
 from pathlib import Path
@@ -37,6 +38,123 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_capture_rollouts(value: str) -> set[int] | str:
+    text = value.strip().lower()
+    if text in {"all", "*"}:
+        return "all"
+    result: set[int] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            start, end = int(start_s), int(end_s)
+            result.update(range(start, end + 1))
+        else:
+            result.add(int(part))
+    return result
+
+
+def _should_nsys_capture(role: str, rollout_id: int) -> bool:
+    value = os.getenv("VIME_NSYS_CAPTURE_ROLLOUTS", "").strip()
+    if not value:
+        return False
+    capture_role = os.getenv("VIME_NSYS_CAPTURE_ROLE", "actor").strip().lower()
+    if capture_role not in {"all", role.lower()}:
+        return False
+    try:
+        rollouts = _parse_capture_rollouts(value)
+    except ValueError:
+        logger.warning("Ignoring invalid VIME_NSYS_CAPTURE_ROLLOUTS=%r", value)
+        return False
+    return rollouts == "all" or rollout_id in rollouts
+
+
+class _NsysCudaProfilerCapture:
+    def __init__(self, role: str, rollout_id: int, name: str):
+        self.role = role
+        self.rollout_id = rollout_id
+        self.name = name
+        self.enabled = _should_nsys_capture(role, rollout_id)
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStart()
+                torch.cuda.nvtx.range_push(f"{self.role}_{self.name}_rollout_{self.rollout_id}")
+                logger.info(
+                    "Nsight Systems cudaProfilerStart: role=%s rollout_id=%s range=%s",
+                    self.role,
+                    self.rollout_id,
+                    self.name,
+                )
+            else:
+                self.enabled = False
+        except Exception:
+            logger.warning("Failed to start Nsight Systems profiler capture.", exc_info=True)
+            self.enabled = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.enabled:
+            return False
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.cudart().cudaProfilerStop()
+            logger.info(
+                "Nsight Systems cudaProfilerStop: role=%s rollout_id=%s range=%s",
+                self.role,
+                self.rollout_id,
+                self.name,
+            )
+        except Exception:
+            logger.warning("Failed to stop Nsight Systems profiler capture.", exc_info=True)
+        return False
+
+
+class _VLLMCudaProfilerCapture:
+    def __init__(self, manager: "RolloutManager", rollout_id: int):
+        self.manager = manager
+        self.rollout_id = rollout_id
+        self.enabled = _should_nsys_capture("rollout", rollout_id)
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        try:
+            engines = self.manager.rollout_engines
+            if not engines:
+                self.enabled = False
+                return self
+            logger.info("Starting vLLM CUDA profiler for rollout_id=%s", self.rollout_id)
+            ray.get([engine.start_profile.remote() for engine in engines])
+        except Exception:
+            logger.warning("Failed to start vLLM CUDA profiler capture.", exc_info=True)
+            try:
+                if "engines" in locals():
+                    ray.get([engine.stop_profile.remote() for engine in engines])
+            except Exception:
+                logger.warning("Failed to clean up partially started vLLM profiler capture.", exc_info=True)
+            self.enabled = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.enabled:
+            return False
+        try:
+            engines = self.manager.rollout_engines
+            logger.info("Stopping vLLM CUDA profiler for rollout_id=%s", self.rollout_id)
+            ray.get([engine.stop_profile.remote() for engine in engines])
+        except Exception:
+            logger.warning("Failed to stop vLLM CUDA profiler capture.", exc_info=True)
+        return False
 
 
 @dataclasses.dataclass
@@ -485,7 +603,8 @@ class RolloutManager:
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
-        data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        with _VLLMCudaProfilerCapture(self, rollout_id), _NsysCudaProfilerCapture("rollout", rollout_id, "generate"):
+            data, metrics = self._get_rollout_data(rollout_id=rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:

@@ -445,12 +445,12 @@ class VLLMEngine(RayActor):
     ):
         response = requests.post(f"http://{self.server_host}:{self.server_port}/start_profile", json={})
         response.raise_for_status()
-        return response
+        return {"ok": True}
 
     def stop_profile(self):
         response = requests.post(f"http://{self.server_host}:{self.server_port}/stop_profile", json={})
         response.raise_for_status()
-        return response
+        return {"ok": True}
 
     def simulate_crash(self):
         if self.args.rollout_external or not getattr(self, "process", None):
