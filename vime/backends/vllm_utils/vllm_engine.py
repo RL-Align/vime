@@ -61,6 +61,7 @@ def _build_subprocess_env(server_args_dict: dict[str, Any]) -> dict[str, str]:
     env.setdefault("NCCL_CUMEM_ENABLE", "0")
     env["CUDA_VISIBLE_DEVICES"] = server_args_dict["_visible_devices"]
     env.setdefault("VLLM_SERVER_DEV_MODE", "1")
+    env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     if getattr(args, "vllm_enable_deterministic_inference", False):
         env["VLLM_BATCH_INVARIANT"] = "1"
     if getattr(args, "colocate", False):
@@ -83,6 +84,13 @@ def _build_subprocess_env(server_args_dict: dict[str, Any]) -> dict[str, str]:
 
 def _run_vllm_server(kwargs: dict, env: dict) -> None:
     os.environ.update(env)
+    if os.environ.get("VIME_VLLM_FAULTHANDLER", "0") == "1":
+        import faulthandler
+        import signal
+        import sys
+
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+        faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 
     from vllm.entrypoints.cli.serve import ServeSubcommand
     from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args

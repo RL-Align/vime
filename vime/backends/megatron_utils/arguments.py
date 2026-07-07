@@ -73,7 +73,22 @@ def _is_moe_config(hf_config):
 def validate_args(args):
     """Run megatron's own validate_args plus vime-specific megatron validations."""
 
-    _megatron_validate_args(args)
+    skip_grouped_gemm_capability_check = (
+        os.environ.get("VIME_SKIP_MOE_GROUPED_GEMM_CAPABILITY_CHECK", "0") == "1"
+        and getattr(args, "moe_grouped_gemm", False)
+    )
+    if skip_grouped_gemm_capability_check:
+        logger.info(
+            "Skipping Megatron grouped GEMM compute capability check during argument "
+            "validation; preserving --moe-grouped-gemm for runtime."
+        )
+        args.moe_grouped_gemm = False
+        try:
+            _megatron_validate_args(args)
+        finally:
+            args.moe_grouped_gemm = True
+    else:
+        _megatron_validate_args(args)
 
     # always use varlen
     args.variable_seq_lengths = True

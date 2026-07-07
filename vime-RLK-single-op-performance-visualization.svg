@@ -1,0 +1,250 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+  <title id="title">RL-Kernel linear_logp single-operator performance on Qwen3-30B-A3B 8xH100</title>
+  <desc id="desc">Comparison of baseline native output layer plus native logprob against RL-Kernel fused linear_logp candidate for T01, T03, and T06.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f9fb; }
+      .panel { fill: #ffffff; stroke: #dce3ea; stroke-width: 1.2; }
+      .panel-soft { fill: #fbfcfe; stroke: #dce3ea; stroke-width: 1.2; }
+      .title { font: 800 44px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #171b21; letter-spacing: 0; }
+      .subtitle { font: 500 19px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #59636f; letter-spacing: 0; }
+      .section-title { font: 800 23px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #171b21; letter-spacing: 0; }
+      .section-subtitle { font: 500 14px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #66717d; letter-spacing: 0; }
+      .label { font: 700 15px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #242a32; letter-spacing: 0; }
+      .small { font: 500 13px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #66717d; letter-spacing: 0; }
+      .tiny { font: 500 11px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #7a8490; letter-spacing: 0; }
+      .value { font: 800 14px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #1d232b; letter-spacing: 0; }
+      .metric { font: 900 28px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #171b21; letter-spacing: 0; }
+      .metric-label { font: 700 12px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #5e6874; letter-spacing: .4px; }
+      .baseline { fill: #e35d4f; }
+      .baseline-soft { fill: #fee6e1; }
+      .candidate { fill: #0b9f8a; }
+      .candidate-soft { fill: #dff6f1; }
+      .accent { fill: #2b67c6; }
+      .accent-soft { fill: #e6eefc; }
+      .gold { fill: #c47d00; }
+      .gold-soft { fill: #fff0cf; }
+      .axis { stroke: #cfd7df; stroke-width: 1; }
+      .dash { stroke: #e6ebf0; stroke-width: 1; stroke-dasharray: 4 8; }
+      .flow-arrow { stroke: #85919e; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .flow-arrow-candidate { stroke: #0b9f8a; stroke-width: 2.6; fill: none; marker-end: url(#arrow-green); }
+    </style>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#2b3a4a" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#85919e"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#0b9f8a"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1000"/>
+  <path d="M0 152H1600M0 610H1600M0 930H1600" stroke="#edf1f5" stroke-width="1"/>
+
+  <text class="title" x="70" y="80">RL-Kernel fused linear_logp cuts single-op cost</text>
+  <text class="subtitle" x="72" y="116">Qwen3-30B-A3B · 8xH100 · TP=2 · full-gradient · 12 rollout · no trace · stable window</text>
+  <g transform="translate(72,138)">
+    <rect class="baseline-soft" x="0" y="0" width="14" height="14" rx="3"/>
+    <text class="small" x="22" y="12">baseline: native output layer + native logprob</text>
+    <rect class="candidate-soft" x="286" y="0" width="14" height="14" rx="3"/>
+    <text class="small" x="308" y="12">candidate: save-logits full-gradient fused-tile linear_logp</text>
+  </g>
+
+  <g transform="translate(1040,42)">
+    <rect class="panel" x="0" y="0" width="118" height="82" rx="8"/>
+    <text class="metric" x="18" y="38">0</text>
+    <text class="metric-label" x="18" y="61">FALLBACKS</text>
+  </g>
+  <g transform="translate(1175,42)">
+    <rect class="panel" x="0" y="0" width="140" height="82" rx="8"/>
+    <text class="metric" x="18" y="38">2.32x</text>
+    <text class="metric-label" x="18" y="61">MAX FWD</text>
+  </g>
+  <g transform="translate(1332,42)">
+    <rect class="panel" x="0" y="0" width="170" height="82" rx="8"/>
+    <text class="metric" x="18" y="38">1.84x</text>
+    <text class="metric-label" x="18" y="61">MAX FWD+BWD</text>
+  </g>
+
+  <g transform="translate(70,170)" filter="url(#shadow)">
+    <rect class="panel" x="0" y="0" width="450" height="385" rx="10"/>
+  </g>
+  <g transform="translate(70,170)">
+    <text class="section-title" x="26" y="42">Forward CUDA time</text>
+    <text class="section-subtitle" x="26" y="66">Lower is better. Baseline output layer + native logprob vs fused candidate.</text>
+
+    <line class="dash" x1="140" y1="92" x2="140" y2="336"/>
+    <line class="dash" x1="216" y1="92" x2="216" y2="336"/>
+    <line class="dash" x1="293" y1="92" x2="293" y2="336"/>
+    <line class="dash" x1="370" y1="92" x2="370" y2="336"/>
+    <text class="tiny" x="132" y="356">0</text>
+    <text class="tiny" x="205" y="356">5</text>
+    <text class="tiny" x="279" y="356">10</text>
+    <text class="tiny" x="356" y="356">15 ms</text>
+
+    <text class="label" x="26" y="123">T01</text>
+    <text class="small" x="26" y="143">796 tok/call</text>
+    <rect class="baseline" x="140" y="106" width="79" height="17" rx="4"/>
+    <rect class="candidate" x="140" y="130" width="54" height="17" rx="4"/>
+    <text class="value" x="396" y="120" text-anchor="end">5.14 ms</text>
+    <text class="value" x="396" y="144" text-anchor="end">3.51 ms</text>
+    <text class="gold" x="410" y="144" style="font:800 13px Inter,ui-sans-serif,system-ui">1.46x</text>
+
+    <text class="label" x="26" y="205">T03</text>
+    <text class="small" x="26" y="225">1.82k tok/call</text>
+    <rect class="baseline" x="140" y="188" width="119" height="17" rx="4"/>
+    <rect class="candidate" x="140" y="212" width="52" height="17" rx="4"/>
+    <text class="value" x="396" y="202" text-anchor="end">7.78 ms</text>
+    <text class="value" x="396" y="226" text-anchor="end">3.36 ms</text>
+    <text class="gold" x="410" y="226" style="font:800 13px Inter,ui-sans-serif,system-ui">2.32x</text>
+
+    <text class="label" x="26" y="287">T06</text>
+    <text class="small" x="26" y="307">6.83k tok/call</text>
+    <rect class="baseline" x="140" y="270" width="223" height="17" rx="4"/>
+    <rect class="candidate" x="140" y="294" width="117" height="17" rx="4"/>
+    <text class="value" x="396" y="284" text-anchor="end">14.52 ms</text>
+    <text class="value" x="396" y="308" text-anchor="end">7.62 ms</text>
+    <text class="gold" x="410" y="308" style="font:800 13px Inter,ui-sans-serif,system-ui">1.91x</text>
+  </g>
+
+  <g transform="translate(565,170)" filter="url(#shadow)">
+    <rect class="panel" x="0" y="0" width="500" height="385" rx="10"/>
+  </g>
+  <g transform="translate(565,170)">
+    <text class="section-title" x="26" y="42">Forward + backward CUDA time</text>
+    <text class="section-subtitle" x="26" y="66">Full-gradient actor train path. Candidate keeps the fused tile path in backward.</text>
+
+    <line class="dash" x1="150" y1="92" x2="150" y2="336"/>
+    <line class="dash" x1="217" y1="92" x2="217" y2="336"/>
+    <line class="dash" x1="283" y1="92" x2="283" y2="336"/>
+    <line class="dash" x1="350" y1="92" x2="350" y2="336"/>
+    <line class="dash" x1="417" y1="92" x2="417" y2="336"/>
+    <text class="tiny" x="142" y="356">0</text>
+    <text class="tiny" x="205" y="356">10</text>
+    <text class="tiny" x="271" y="356">20</text>
+    <text class="tiny" x="338" y="356">30</text>
+    <text class="tiny" x="400" y="356">36 ms</text>
+
+    <text class="label" x="26" y="123">T01</text>
+    <text class="small" x="26" y="143">smoke</text>
+    <rect class="baseline" x="150" y="106" width="102" height="17" rx="4"/>
+    <rect class="candidate" x="150" y="130" width="82" height="17" rx="4"/>
+    <text class="value" x="438" y="120" text-anchor="end">15.24 ms</text>
+    <text class="value" x="438" y="144" text-anchor="end">12.37 ms</text>
+    <text class="gold" x="452" y="144" style="font:800 13px Inter,ui-sans-serif,system-ui">1.23x</text>
+
+    <text class="label" x="26" y="205">T03</text>
+    <text class="small" x="26" y="225">target-low</text>
+    <rect class="baseline" x="150" y="188" width="124" height="17" rx="4"/>
+    <rect class="candidate" x="150" y="212" width="69" height="17" rx="4"/>
+    <text class="value" x="438" y="202" text-anchor="end">18.56 ms</text>
+    <text class="value" x="438" y="226" text-anchor="end">10.37 ms</text>
+    <text class="gold" x="452" y="226" style="font:800 13px Inter,ui-sans-serif,system-ui">1.79x</text>
+
+    <text class="label" x="26" y="287">T06</text>
+    <text class="small" x="26" y="307">max token call</text>
+    <rect class="baseline" x="150" y="270" width="226" height="17" rx="4"/>
+    <rect class="candidate" x="150" y="294" width="123" height="17" rx="4"/>
+    <text class="value" x="438" y="284" text-anchor="end">33.96 ms</text>
+    <text class="value" x="438" y="308" text-anchor="end">18.50 ms</text>
+    <text class="gold" x="452" y="308" style="font:800 13px Inter,ui-sans-serif,system-ui">1.84x</text>
+  </g>
+
+  <g transform="translate(1110,170)" filter="url(#shadow)">
+    <rect class="panel" x="0" y="0" width="420" height="385" rx="10"/>
+  </g>
+  <g transform="translate(1110,170)">
+    <text class="section-title" x="26" y="42">Reserved memory delta</text>
+    <text class="section-subtitle" x="26" y="66">Single-op memory probe, MB converted to GiB. Lower is better.</text>
+
+    <line class="dash" x1="122" y1="92" x2="122" y2="336"/>
+    <line class="dash" x1="194" y1="92" x2="194" y2="336"/>
+    <line class="dash" x1="266" y1="92" x2="266" y2="336"/>
+    <line class="dash" x1="338" y1="92" x2="338" y2="336"/>
+    <text class="tiny" x="114" y="356">0</text>
+    <text class="tiny" x="182" y="356">10</text>
+    <text class="tiny" x="254" y="356">20</text>
+    <text class="tiny" x="322" y="356">32 GiB</text>
+
+    <text class="label" x="26" y="123">T01</text>
+    <text class="small" x="26" y="143">small logits</text>
+    <rect class="baseline" x="122" y="106" width="29" height="17" rx="4"/>
+    <rect class="candidate" x="122" y="130" width="22" height="17" rx="4"/>
+    <text class="value" x="356" y="120" text-anchor="end">3.96 GiB</text>
+    <text class="value" x="356" y="144" text-anchor="end">3.04 GiB</text>
+
+    <text class="label" x="26" y="205">T03</text>
+    <text class="small" x="26" y="225">larger tokens</text>
+    <rect class="baseline" x="122" y="188" width="47" height="17" rx="4"/>
+    <rect class="candidate" x="122" y="212" width="34" height="17" rx="4"/>
+    <text class="value" x="356" y="202" text-anchor="end">6.53 GiB</text>
+    <text class="value" x="356" y="226" text-anchor="end">4.75 GiB</text>
+
+    <text class="label" x="26" y="287">T06</text>
+    <text class="small" x="26" y="307">large token call</text>
+    <rect class="baseline" x="122" y="270" width="228" height="17" rx="4"/>
+    <rect class="candidate" x="122" y="294" width="188" height="17" rx="4"/>
+    <text class="value" x="356" y="284" text-anchor="end">31.58 GiB</text>
+    <text class="value" x="356" y="308" text-anchor="end">26.08 GiB</text>
+
+    <rect class="accent-soft" x="26" y="326" width="143" height="32" rx="7"/>
+    <text class="accent" x="42" y="347" style="font:800 13px Inter,ui-sans-serif,system-ui">T06 saves 5.50 GiB</text>
+  </g>
+
+  <g transform="translate(70,600)" filter="url(#shadow)">
+    <rect class="panel-soft" x="0" y="0" width="1460" height="305" rx="10"/>
+  </g>
+  <g transform="translate(70,600)">
+    <text class="section-title" x="28" y="44">What changed in the operator path</text>
+    <text class="section-subtitle" x="28" y="69">The candidate changes the dataflow, not just the timing wrapper.</text>
+
+    <text class="label" x="40" y="120">baseline</text>
+    <rect class="baseline-soft" x="142" y="94" width="170" height="58" rx="8"/>
+    <text class="label" x="164" y="119">hidden states</text>
+    <text class="tiny" x="164" y="138">[T, hidden]</text>
+    <path class="flow-arrow" d="M322 123H382"/>
+    <rect class="baseline-soft" x="392" y="94" width="210" height="58" rx="8"/>
+    <text class="label" x="414" y="119">native output layer</text>
+    <text class="tiny" x="414" y="138">materializes full logits</text>
+    <path class="flow-arrow" d="M612 123H672"/>
+    <rect class="baseline-soft" x="682" y="94" width="210" height="58" rx="8"/>
+    <text class="label" x="704" y="119">[T, V] logits</text>
+    <text class="tiny" x="704" y="138">large HBM read/write</text>
+    <path class="flow-arrow" d="M902 123H962"/>
+    <rect class="baseline-soft" x="972" y="94" width="240" height="58" rx="8"/>
+    <text class="label" x="994" y="119">native logprob</text>
+    <text class="tiny" x="994" y="137">clone + softmax/logsumexp</text>
+    <text class="tiny" x="994" y="150">+ gather selected token</text>
+    <path class="flow-arrow" d="M1222 123H1282"/>
+    <rect class="baseline-soft" x="1292" y="94" width="124" height="58" rx="8"/>
+    <text class="label" x="1314" y="119">logprob</text>
+    <text class="tiny" x="1314" y="138">[T]</text>
+
+    <text class="label" x="40" y="218">candidate</text>
+    <rect class="candidate-soft" x="142" y="192" width="170" height="58" rx="8"/>
+    <text class="label" x="164" y="217">hidden + W</text>
+    <text class="tiny" x="164" y="236">bf16, TP shard</text>
+    <path class="flow-arrow-candidate" d="M322 221H470"/>
+    <rect class="candidate-soft" x="482" y="184" width="364" height="74" rx="8"/>
+    <text class="label" x="510" y="214">SM90 fused-tile linear_logp</text>
+    <text class="tiny" x="510" y="235">TMA/WGMMA tile GEMM</text>
+    <text class="tiny" x="510" y="250">local lse + target logit</text>
+    <path class="flow-arrow-candidate" d="M856 221H998"/>
+    <rect class="candidate-soft" x="1010" y="192" width="220" height="58" rx="8"/>
+    <text class="label" x="1032" y="217">TP merge</text>
+    <text class="tiny" x="1032" y="236">global selected logprob</text>
+    <path class="flow-arrow-candidate" d="M1240 221H1300"/>
+    <rect class="candidate-soft" x="1312" y="192" width="104" height="58" rx="8"/>
+    <text class="label" x="1334" y="217">logprob</text>
+    <text class="tiny" x="1334" y="236">[T]</text>
+
+    <rect class="gold-soft" x="40" y="266" width="1376" height="24" rx="6"/>
+    <text class="gold" x="58" y="283" style="font:800 13px Inter,ui-sans-serif,system-ui">Key reason:</text>
+    <text class="small" x="144" y="283">candidate computes selected-token logprob without framework-level full logits materialization, reducing HBM traffic, allocator pressure, and Python-side dispatch.</text>
+  </g>
+
+  <text class="tiny" x="72" y="952">Source: /workspace/vime/vime-RLK-final-metrics-config-matrix.md · T01/T03/T06 full-gradient runs · baseline spike rounds excluded from stable-window single-op averages.</text>
+  <text class="tiny" x="72" y="972">Candidate path: save-logits / RL-Kernel FusedLinearLogpSM90Op, fused-tile bf16 full-gradient tensor-parallel fast path, fallback=0.</text>
+</svg>

@@ -145,6 +145,43 @@ def _maybe_get_cpu_backup(x: torch.Tensor):
     return x
 
 
+def _set_tensor_parallel_attrs(tensor: torch.Tensor, source: torch.Tensor, *, partition_dim: int) -> torch.Tensor:
+    tensor.tensor_model_parallel = getattr(source, "tensor_model_parallel", False)
+    tensor.partition_dim = partition_dim
+    tensor.partition_stride = 1
+    tensor.parallel_mode = getattr(source, "parallel_mode", None)
+    return tensor
+
+
+def _iter_grouped_mlp_expert_weights(
+    args: Namespace,
+    layer_idx: int,
+    rest: str,
+    param: torch.Tensor,
+    *,
+    ep_size: int,
+    expert_offset: int,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    num_local_experts = args.num_experts // ep_size
+    prefix = f"module.module.decoder.layers.{layer_idx}.mlp.experts"
+
+    if rest == "mlp.experts.weight1":
+        expert_tensors = param.view(num_local_experts, args.hidden_size, -1).transpose(-1, -2)
+        partition_dim = 0
+        target = "linear_fc1"
+    elif rest == "mlp.experts.weight2":
+        expert_tensors = param.view(num_local_experts, -1, args.hidden_size).transpose(-1, -2)
+        partition_dim = 1
+        target = "linear_fc2"
+    else:
+        return
+
+    for local_expert_idx, expert_tensor in enumerate(expert_tensors):
+        expert_idx = expert_offset + local_expert_idx
+        name = f"{prefix}.{target}.weight{expert_idx}"
+        yield name, _set_tensor_parallel_attrs(expert_tensor, param, partition_dim=partition_dim)
+
+
 def _named_params_and_buffers_vanilla(model: Sequence[torch.nn.Module]) -> Iterator[tuple[str, torch.Tensor]]:
     for vp_stage, model_module in enumerate(model):
 
@@ -211,6 +248,17 @@ def _named_params_and_buffers_global(
 
             layer_idx, rest = match.groups()
             layer_idx = int(layer_idx) + layer_offset
+
+            if rest in {"mlp.experts.weight1", "mlp.experts.weight2"}:
+                yield from _iter_grouped_mlp_expert_weights(
+                    args,
+                    layer_idx,
+                    rest,
+                    param,
+                    ep_size=ep_size,
+                    expert_offset=expert_offset,
+                )
+                continue
 
             # this is hardcoded for te grouped matmul
             expert_pattern = r"mlp\.experts\.(.+)\.(weight|bias)(\d+)"

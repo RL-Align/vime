@@ -14,6 +14,7 @@ https://docs.vllm.ai/en/stable/examples/rl/rlhf_ipc/
 from __future__ import annotations
 
 import os
+import time
 from argparse import Namespace
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
@@ -289,9 +290,29 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
 
-        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+        for bucket_idx, hf_named_tensors in enumerate(
+            self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights), start=1
+        ):
+            if rank == 0:
+                print(
+                    f"[weight-sync] bucket {bucket_idx}: sending {len(hf_named_tensors)} HF tensors to rollout",
+                    flush=True,
+                )
+            t0 = time.perf_counter()
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+            if rank == 0:
+                print(
+                    f"[weight-sync] bucket {bucket_idx}: IPC payload submitted in {time.perf_counter() - t0:.2f}s "
+                    f"({len(refs)} refs)",
+                    flush=True,
+                )
+            t1 = time.perf_counter()
             ray.get(refs)
+            if rank == 0:
+                print(
+                    f"[weight-sync] bucket {bucket_idx}: rollout update returned in {time.perf_counter() - t1:.2f}s",
+                    flush=True,
+                )
             # Free GPU tensors so the caching allocator can reuse the blocks,
             # then release CUDA IPC cache entries whose consumers (vLLM engines)
             # have already closed their IPC handles.

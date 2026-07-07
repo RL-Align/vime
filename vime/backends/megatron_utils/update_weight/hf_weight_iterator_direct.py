@@ -1,4 +1,5 @@
 import dataclasses
+import time
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -22,13 +23,41 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
 
     def get_hf_weight_chunks(self, megatron_local_weights, progress_desc: str = "Update weights"):
         rank = dist.get_rank()
+        total_buckets = len(self.megatron_local_param_info_buckets)
 
-        for megatron_local_param_infos in tqdm(
-            self.megatron_local_param_info_buckets, disable=rank != 0, desc=progress_desc
+        for bucket_idx, megatron_local_param_infos in enumerate(
+            tqdm(self.megatron_local_param_info_buckets, disable=rank != 0, desc=progress_desc), start=1
         ):
+            if rank == 0:
+                bucket_bytes = _bucket_size_bytes(megatron_local_param_infos)
+                print(
+                    f"[weight-sync] bucket {bucket_idx}/{total_buckets}: "
+                    f"{len(megatron_local_param_infos)} params, {bucket_bytes / 1024**2:.1f} MiB begin",
+                    flush=True,
+                )
+            t0 = time.perf_counter()
             megatron_full_params = _get_megatron_full_params(megatron_local_param_infos, megatron_local_weights)
+            if rank == 0:
+                print(
+                    f"[weight-sync] bucket {bucket_idx}/{total_buckets}: "
+                    f"megatron all-gather done in {time.perf_counter() - t0:.2f}s",
+                    flush=True,
+                )
+            t1 = time.perf_counter()
             hf_named_tensors = self._convert_to_hf_named_tensors(megatron_full_params, megatron_local_param_infos)
+            if rank == 0:
+                print(
+                    f"[weight-sync] bucket {bucket_idx}/{total_buckets}: "
+                    f"HF convert done in {time.perf_counter() - t1:.2f}s "
+                    f"({len(hf_named_tensors)} tensors)",
+                    flush=True,
+                )
             yield hf_named_tensors
+            if rank == 0:
+                print(
+                    f"[weight-sync] bucket {bucket_idx}/{total_buckets}: finished",
+                    flush=True,
+                )
             del megatron_full_params
 
     def _convert_to_hf_named_tensors(self, megatron_full_params: Sequence[torch.Tensor], param_infos: list[ParamInfo]):
@@ -53,7 +82,9 @@ def _get_megatron_full_params(
         if dist.get_rank() == info.src_rank:
             params.append(
                 torch.nn.Parameter(
-                    megatron_local_weights[info.name].to(device=torch.cuda.current_device(), non_blocking=True),
+                    megatron_local_weights[info.name]
+                    .to(device=torch.cuda.current_device(), non_blocking=True)
+                    .contiguous(),
                     requires_grad=False,
                 )
             )
@@ -101,6 +132,17 @@ def _get_megatron_full_params(
     gathered_params = all_gather_params_async(list(zip(megatron_local_param_infos, params, strict=False)))
 
     return gathered_params
+
+
+def _bucket_size_bytes(param_infos: Sequence[ParamInfo]) -> int:
+    total = 0
+    for info in param_infos:
+        if ".experts." in info.name:
+            tp_size = mpu.get_expert_tensor_parallel_world_size()
+        else:
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+        total += info.size * tp_size
+    return total
 
 
 def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torch.nn.Module]) -> list[list[ParamInfo]]:
