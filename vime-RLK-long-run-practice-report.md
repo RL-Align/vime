@@ -750,6 +750,1005 @@ GPU7 40993 MiB
 4. 查是否开了 trace。
 5. 查 baseline 是否包含 spike，不能用异常 spike 夸大或误判。
 
+## RL 框架级工作流程
+
+这一节按 vime 本轮 8 卡 colocate 训练的实际代码路径讲清楚 RL 框架如何工作。重点不是命令行参数，而是 Ray、vLLM、Megatron、loss、权重同步之间的数据和控制流。
+
+本轮入口脚本最终提交的 Ray job 是：
+
+```bash
+ray job submit --address="http://127.0.0.1:8265" \
+  --runtime-env-json="${RUNTIME_ENV_JSON}" \
+  -- python3 train.py \
+  --actor-num-nodes 1 \
+  --actor-num-gpus-per-node ${NUM_GPUS} \
+  --colocate \
+  ...
+```
+
+所以本轮主流程在：
+
+```text
+/workspace/vime/train.py
+```
+
+不是 `train_async.py`。`train_async.py` 明确 `assert not args.colocate`，而本轮使用 `--colocate`，训练和 rollout 共享同一组 8 张 H100，通过 sleep/wake 和 weight sync 协调显存。
+
+### 总体循环
+
+`train.py` 的主循环可以抽象成：
+
+```python
+def train(args):
+    pgs = create_placement_groups(args)
+    rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+    actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+
+    if args.offload_rollout:
+        rollout_manager.onload_weights()
+
+    actor_model.update_weights()
+
+    if args.offload_rollout:
+        rollout_manager.onload_kv()
+
+    for rollout_id in range(args.start_rollout_id, args.num_rollout):
+        rollout_data_ref = rollout_manager.generate.remote(rollout_id)
+
+        if args.offload_rollout:
+            rollout_manager.offload()
+
+        actor_model.async_train(rollout_id, rollout_data_ref)
+
+        if args.offload_rollout:
+            rollout_manager.onload_weights()
+
+        actor_model.update_weights()
+
+        if args.offload_rollout:
+            rollout_manager.onload_kv()
+```
+
+真实代码里还有 eval、save、critic、global dataset、periodic action，但 T01/T03/T06/T07 这条主线就是：
+
+```text
+启动 Ray/vLLM/Megatron
+-> 初始 Megatron actor weights 推给 vLLM
+-> vLLM rollout 生成 samples
+-> samples 转成 Megatron train batch
+-> Megatron actor train
+-> Megatron 新权重同步到 vLLM
+-> 下一轮 rollout
+```
+
+### Ray placement group：谁占哪张 GPU
+
+代码位置：
+
+```text
+/workspace/vime/vime/ray/placement_group.py
+create_placement_groups()
+create_rollout_manager()
+create_training_models()
+```
+
+本轮 `--colocate` 为 True，因此：
+
+```python
+elif args.colocate:
+    num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+    rollout_offset = 0
+```
+
+含义：
+
+- Ray 只创建一个包含 8 个 GPU bundle 的 placement group。
+- actor 和 rollout 都从同一个 placement group 里取资源。
+- rollout offset 是 0，说明 vLLM engine 和 Megatron actor 逻辑上共享同一批 GPU。
+
+`_create_placement_group()` 做两件关键事：
+
+1. 创建 `bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]`。
+2. 用临时 `InfoActor` 查询每个 bundle 实际落在哪个 node/GPU，然后按 node 和 GPU ID 排序，得到稳定的 `pg_reordered_bundle_indices` 和 `pg_reordered_gpu_ids`。
+
+这一步重要是因为 Ray 的 bundle index 不一定天然等于物理 GPU ID。后续 vLLM 的 `base_gpu_id`、Megatron rank 和 colocate weight sync 都依赖这个排序。
+
+### RolloutManager：vLLM rollout 的控制面
+
+代码位置：
+
+```text
+/workspace/vime/vime/ray/rollout.py
+RolloutManager
+RolloutServer
+ServerGroup
+```
+
+`create_rollout_manager()` 创建一个 Ray actor：
+
+```python
+rollout_manager = RolloutManager.options(
+    num_cpus=1,
+    num_gpus=0,
+).remote(args, pg)
+```
+
+`RolloutManager.__init__()` 做的事：
+
+1. 加载数据源：
+
+   ```python
+   data_source_cls = load_function(self.args.data_source_path)
+   self.data_source = data_source_cls(args)
+   ```
+
+2. 加载 rollout 函数：
+
+   ```python
+   self.generate_rollout = load_function(self.args.rollout_function_path)
+   self.eval_generate_rollout = load_function(self.args.eval_function_path)
+   ```
+
+3. 如果不是 debug train-only，就启动 vLLM servers：
+
+   ```python
+   self.servers = start_rollout_servers(args, pg)
+   ```
+
+4. 创建 rollout engine lock：
+
+   ```python
+   self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+   ```
+
+这个 lock 在权重同步时用来协调 rollout engines，不让 vLLM 在更新权重时同时生成。
+
+### ServerGroup：如何启动 vLLM engine
+
+代码位置：
+
+```text
+/workspace/vime/vime/ray/rollout.py
+ServerGroup.start_engines()
+```
+
+每个 `ServerGroup` 表示一组同构 vLLM engine。T01/T03/T06/T07 这种单模型单 engine 配置通常只有一个主要 server group。
+
+启动逻辑：
+
+```python
+RolloutRayActor = ray.remote(VLLMEngine)
+
+rollout_engine = RolloutRayActor.options(
+    num_cpus=num_cpus,
+    num_gpus=0.2,
+    scheduling_strategy=PlacementGroupSchedulingStrategy(...),
+    runtime_env={"env_vars": env_vars},
+).remote(
+    self.args,
+    rank=global_rank,
+    worker_type=self.worker_type,
+    base_gpu_id=base_gpu_id,
+    vllm_overrides=self.vllm_overrides,
+    num_gpus_per_engine=self.num_gpus_per_engine,
+)
+```
+
+这里 Ray actor 只申请 `num_gpus=0.2`，不是因为 vLLM 只用 0.2 张卡，而是因为真正的 vLLM server 是 actor 里再 spawn 出来的子进程。Ray 资源只是占位和调度，实际 CUDA 可见设备通过 `CUDA_VISIBLE_DEVICES` 控制。
+
+`base_gpu_id` 来自 placement group 的排序结果，表示该 vLLM engine 从哪张物理 GPU 开始取连续设备。
+
+### VLLMEngine：Ray actor 到 vLLM server 子进程
+
+代码位置：
+
+```text
+/workspace/vime/vime/backends/vllm_utils/vllm_engine.py
+VLLMEngine.init()
+launch_server_process()
+_build_subprocess_env()
+_run_vllm_server()
+```
+
+`VLLMEngine.init()` 先计算 server args：
+
+```python
+server_args_dict, external_engine_need_check_fields = _compute_server_args(...)
+```
+
+然后普通本地模式走：
+
+```python
+self._init_normal(server_args_dict)
+```
+
+`_init_normal()` 里真正启动 vLLM：
+
+```python
+self.process = launch_server_process(server_args_dict)
+```
+
+`launch_server_process()` 做三件关键事：
+
+1. 构造子进程环境：
+
+   ```python
+   env = _build_subprocess_env(server_args_dict)
+   ```
+
+2. 强制 multiprocessing spawn：
+
+   ```python
+   multiprocessing.set_start_method("spawn", force=True)
+   p = multiprocessing.Process(target=_run_vllm_server, args=(kwargs, env))
+   p.start()
+   ```
+
+3. node rank 0 等 `/health`：
+
+   ```python
+   _wait_server_healthy(base_url=..., is_process_alive=lambda: p.is_alive())
+   ```
+
+`_build_subprocess_env()` 是本轮 debug 的关键点之一：
+
+```python
+env["CUDA_VISIBLE_DEVICES"] = server_args_dict["_visible_devices"]
+env.setdefault("VLLM_SERVER_DEV_MODE", "1")
+env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+env.setdefault("NCCL_CUMEM_ENABLE", "0")
+```
+
+含义：
+
+- Ray actor 自己不直接决定 vLLM 用哪些 GPU，vLLM server 子进程通过 `CUDA_VISIBLE_DEVICES` 绑定。
+- `VLLM_WORKER_MULTIPROC_METHOD=spawn` 避免 fork 继承父进程复杂 CUDA/Ray 状态。
+- colocate 模式会把 vime root 补进 `PYTHONPATH`，并允许 vLLM IPC weight update 的序列化：
+
+  ```python
+  env.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+  ```
+
+`_run_vllm_server()` 直接调用 vLLM OpenAI server 入口：
+
+```python
+from vllm.entrypoints.cli.serve import ServeSubcommand
+...
+ServeSubcommand.cmd(args)
+```
+
+因此 vime 不是手写推理内核，而是把 vLLM 当作一个 HTTP server 管理。
+
+### vLLM sleep/wake：colocate 显存协调
+
+代码位置：
+
+```text
+/workspace/vime/vime/backends/vllm_utils/vllm_engine.py
+release_memory_occupation()
+resume_memory_occupation()
+```
+
+vLLM offload：
+
+```python
+def release_memory_occupation(self, level: int = 2):
+    self.flush_cache()
+    response = requests.post(f"http://{self.server_host}:{self.server_port}/sleep", params={"level": level})
+```
+
+vLLM onload：
+
+```python
+def resume_memory_occupation(self, tags: list[str] = None):
+    tags = _normalize_vllm_wake_tags(tags)
+    response = requests.post(f"http://{self.server_host}:{self.server_port}/wake_up", params=wake_params)
+```
+
+本轮主要用两个 tag：
+
+```text
+weights
+kv_cache
+```
+
+`train.py` 里可以看到顺序：
+
+```python
+if args.offload_rollout:
+    rollout_manager.onload_weights()
+
+actor_model.update_weights()
+
+if args.offload_rollout:
+    rollout_manager.onload_kv()
+```
+
+这表示：
+
+1. 先 wake vLLM weights，让它能接收新权重。
+2. Megatron actor 把训练后的权重同步到 vLLM。
+3. 再 wake KV cache / CUDA graph 等生成所需状态。
+
+训练时则反向：
+
+```python
+rollout_data_ref = rollout_manager.generate.remote(rollout_id)
+
+if args.offload_rollout:
+    rollout_manager.offload()
+
+actor_model.async_train(...)
+```
+
+也就是 rollout 生成结束后先让 vLLM sleep，释放显存给 Megatron train。
+
+### rollout 数据如何变成训练 batch
+
+代码位置：
+
+```text
+/workspace/vime/vime/ray/rollout.py
+RolloutManager.generate()
+RolloutManager._get_rollout_data()
+RolloutManager._convert_samples_to_train_data()
+RolloutManager._split_train_data_by_dp()
+```
+
+`RolloutManager.generate()` 的主逻辑：
+
+```python
+data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+data = self._convert_samples_to_train_data(data)
+return self._split_train_data_by_dp(data)
+```
+
+`_get_rollout_data()` 有两种来源：
+
+1. `load_debug_rollout_data`：从磁盘读已保存 rollout。
+2. 正常路径：
+
+   ```python
+   data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
+   metrics = data.metrics
+   data = data.samples
+   ```
+
+`generate_rollout` 是用户配置的 rollout function，本轮 Qwen3/vLLM 路径会通过 vLLM HTTP server 生成 response，并形成 `Sample`。
+
+`_convert_samples_to_train_data()` 把 `Sample` 列表转为训练所需字段：
+
+```python
+train_data = {
+    "tokens": [sample.tokens for sample in samples],
+    "response_lengths": [sample.response_length for sample in samples],
+    "rewards": rewards,
+    "raw_reward": raw_rewards,
+    "truncated": ...,
+    "sample_indices": ...,
+    "rollout_ids": ...,
+    "loss_masks": ...,
+}
+```
+
+几个字段的 RL 含义：
+
+- `tokens`：prompt + response 的完整 token 序列。
+- `response_lengths`：只在 response token 上计算 policy loss。
+- `loss_masks`：哪些 response token 参与 loss。
+- `rewards/raw_reward`：规则 RM 或外部 RM 产生的奖励。
+- `rollout_log_probs`：如果 rollout 侧带回生成时 logprob，可用于 off-policy correction 或 mismatch metric。
+- `rollout_mask_sums`：同一个 rollout 拆成多个 training samples 时，用于保持“每个 rollout 算一次”的归一化口径。
+
+奖励后处理在：
+
+```python
+raw_rewards, rewards = self._post_process_rewards(samples)
+```
+
+例如 GRPO/GSPO 下可以做 group normalization：
+
+```python
+rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
+rewards = rewards - mean
+rewards = rewards / (std + 1e-6)
+```
+
+最后 `_split_train_data_by_dp()` 根据 DP size 和动态 batch schedule 切分给每个 DP rank：
+
+```python
+partitions, micro_batch_indices, num_microbatches, global_batch_sizes = build_dp_schedule(...)
+...
+rollout_data_refs.append(Box(ray.put(rollout_data)))
+```
+
+这里返回的是一组 Ray object refs，每个 DP rank 一个 `Box(ray.put(...))`。训练 actor 后面会按自己的 DP rank 取对应切片。
+
+### Megatron train actors 如何创建
+
+代码位置：
+
+```text
+/workspace/vime/vime/ray/actor_group.py
+RayTrainGroup
+
+/workspace/vime/vime/backends/megatron_utils/actor.py
+MegatronTrainRayActor
+```
+
+`create_training_models()` 创建 actor train group：
+
+```python
+actor_model = allocate_train_group(
+    args=actor_args,
+    num_nodes=args.actor_num_nodes,
+    num_gpus_per_node=args.actor_num_gpus_per_node,
+    pg=pgs["actor"],
+)
+```
+
+`RayTrainGroup._allocate_gpus_for_actor()` 中：
+
+```python
+TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(MegatronTrainRayActor)
+...
+actor = TrainRayActor.options(
+    num_cpus=num_gpus_per_actor,
+    num_gpus=num_gpus_per_actor,
+    scheduling_strategy=PlacementGroupSchedulingStrategy(...),
+).remote(world_size, rank, master_addr, master_port)
+```
+
+每个 GPU 一个 Megatron train actor。Ray 层给 actor 放到对应 bundle 上，Megatron 内部再用 `rank/world_size/master_addr/master_port` 初始化 torch distributed。
+
+传给 train actor 的关键环境变量来自 `scripts/run-qwen3-30B-A3B.sh` 的 Ray runtime env，例如：
+
+```text
+PYTHONPATH
+HF_HOME / TRANSFORMERS_CACHE / TMPDIR
+VIME_RL_KERNEL_LINEAR_LOGP_BACKEND
+VIME_RL_KERNEL_CUDA_EVENT_TIMER
+VIME_SKIP_ZERO_ENTROPY_METRIC
+MEGATRON_LOCAL_ATTENTION_SINGLE_PACKED_SEQ
+MEGATRON_ALLOW_MOE_TP_WITHOUT_SP
+```
+
+`MegatronTrainRayActor.init()` 做的事：
+
+1. 初始化 torch distributed / Megatron：
+
+   ```python
+   monkey_patch_torch_dist()
+   super().init(args, role, ...)
+   init(args)
+   ```
+
+2. 每个 local GPU 依次读 HF config/tokenizer，避免并发写 cache：
+
+   ```python
+   for i in range(args.num_gpus_per_node):
+       if i == dist.get_rank() % args.num_gpus_per_node:
+           self.hf_config = AutoConfig.from_pretrained(...)
+           self.tokenizer = AutoTokenizer.from_pretrained(...)
+       dist.barrier(group=get_gloo_group())
+   ```
+
+3. 构建 Megatron model/optimizer/scheduler：
+
+   ```python
+   self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(...)
+   ```
+
+4. 记录训练并行配置，给 rollout DP split 使用：
+
+   ```python
+   self.train_parallel_config = {
+       "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
+       "cp_size": mpu.get_context_parallel_world_size(),
+       "vpp_size": vpp_size,
+       "microbatch_group_size_per_vp_stage": microbatch_group_size_per_vp_stage,
+   }
+   ```
+
+5. 创建权重备份器：
+
+   ```python
+   self.weights_backuper = TensorBackuper.create(...)
+   self.weights_backuper.backup("actor")
+   ```
+
+6. 根据 colocate 选择权重同步实现：
+
+   ```python
+   if self.args.colocate:
+       update_weight_cls = UpdateWeightFromTensor
+   else:
+       update_weight_cls = UpdateWeightFromDistributed
+   self.weight_updater = update_weight_cls(...)
+   ```
+
+本轮是 colocate，所以走 `UpdateWeightFromTensor`。
+
+### Megatron actor train：从 Ray object 到 GPU tensor
+
+代码位置：
+
+```text
+/workspace/vime/vime/backends/megatron_utils/actor.py
+MegatronTrainRayActor.train()
+MegatronTrainRayActor._get_rollout_data()
+MegatronTrainRayActor.train_actor()
+```
+
+`RayTrainGroup.async_train()` 会对每个 train actor 调：
+
+```python
+actor.train.remote(rollout_id, rollout_data_ref, external_data=...)
+```
+
+`MegatronTrainRayActor.train()` 的结构：
+
+```python
+if self.args.offload_train:
+    self.wake_up()
+
+rollout_data = self._get_rollout_data(rollout_data_ref)
+
+if self.role == "critic":
+    result = self.train_critic(...)
+else:
+    self.train_actor(...)
+
+if self.args.offload_train:
+    del rollout_data
+    self.sleep()
+```
+
+`_get_rollout_data()` 把 CPU/Ray 数据搬到当前 rank 的 GPU：
+
+```python
+rollout_data = process_rollout_data(...)
+rollout_data["tokens"] = [
+    torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device())
+    for t in rollout_data["tokens"]
+]
+rollout_data["loss_masks"] = [
+    torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device())
+    for t in rollout_data["loss_masks"]
+]
+```
+
+如果有 `rollout_log_probs` 或 `teacher_log_probs`，还会按 CP/qkv layout 切到当前 rank 需要的 response 片段：
+
+```python
+slice_log_prob_with_cp(log_prob, total_length, response_length, ...)
+```
+
+### actor train 内部的 RL 计算顺序
+
+代码位置：
+
+```text
+/workspace/vime/vime/backends/megatron_utils/actor.py
+MegatronTrainRayActor.train_actor()
+```
+
+主流程：
+
+```python
+data_iterator = get_data_iterator(rollout_data)
+num_microbatches = rollout_data["num_microbatches"]
+global_batch_sizes = rollout_data["global_batch_sizes"]
+
+if self.args.compute_advantages_and_returns:
+    # 可选：ref / teacher / old_actor logprob
+    rollout_data.update(self.compute_log_prob(...))
+
+    # critic values or external values
+    ...
+
+    compute_advantages_and_returns(self.args, rollout_data)
+
+log_rollout_data(...)
+
+train(
+    rollout_id,
+    self.model,
+    self.optimizer,
+    self.opt_param_scheduler,
+    data_iterator,
+    num_microbatches,
+    global_batch_sizes,
+)
+
+self.weights_backuper.backup("actor")
+```
+
+对 PPO/GRPO 类训练来说，关键概念是：
+
+- rollout 阶段拿到 sample/reward。
+- train 阶段重新计算当前 actor 对这些 response token 的 logprob。
+- 结合 reward/advantage 计算 policy loss。
+- 反向更新 Megatron actor。
+- 更新后的 actor 权重再同步回 vLLM，供下一轮 rollout 使用。
+
+本轮 `kl_loss_coef=0`、`entropy_coef=0`、`VIME_SKIP_ZERO_ENTROPY_METRIC=1`，所以主关注点变成 actor policy loss 所需的 selected-token logprob，这正是 `linear_logp` 的位置。
+
+### Megatron pipeline train step 与 loss_function
+
+代码位置：
+
+```text
+/workspace/vime/vime/backends/megatron_utils/model.py
+train()
+train_one_step()
+```
+
+`train()` 会按 rollout 内的 step 切分调用 `train_one_step()`。`train_one_step()` 定义了给 Megatron pipeline engine 的 `forward_step()`：
+
+```python
+def forward_step(data_iterator, model, return_schedule_plan=False):
+    batch = get_batch(...)
+
+    linear_logp_context = None
+    if _train_should_return_hidden_for_linear_logp(args, return_schedule_plan=return_schedule_plan):
+        linear_logp_context = get_linear_logp_context_from_model(args, model)
+
+    with _probe_baseline_output_layer_forward(args, model):
+        with return_hidden_states_for_linear_logp(args, model, linear_logp_context):
+            output_tensor = model(**forward_kwargs)
+
+    return output_tensor, partial(
+        loss_function,
+        args,
+        batch,
+        num_microbatches,
+        step_global_batch_size,
+        rl_kernel_linear_logp_context=linear_logp_context,
+    )
+```
+
+这个函数是 baseline/candidate 分叉的核心：
+
+- baseline：`linear_logp_context is None`，Megatron model 正常返回 logits，后续 loss 走 `calculate_log_probs_and_entropy(logits, tokens, ...)`。
+- candidate：`linear_logp_context` 非空，`return_hidden_states_for_linear_logp()` 临时让 Megatron 返回 hidden states，loss 里调用 RL-Kernel `linear_logp`，不在 PyTorch 层物化完整 logits。
+
+Megatron 的 forward/backward 由：
+
+```python
+forward_backward_func = get_forward_backward_func()
+losses_reduced = forward_backward_func(
+    forward_step_func=...,
+    data_iterator=data_iterator,
+    model=model,
+    num_microbatches=num_microbatches,
+    ...
+    forward_only=False,
+)
+```
+
+执行。也就是说，RL-Kernel `linear_logp` 并不是绕过 Megatron 训练；它只是替换 actor loss 中“hidden/output_layer -> selected logprob”这一段，仍然在 Megatron pipeline/DDP/optimizer 框架内参与 autograd。
+
+### 权重同步：为什么训练后必须 update_weights
+
+RL 训练里有两个 actor 副本：
+
+```text
+Megatron actor: 训练副本，负责 forward/backward/optimizer.step
+vLLM actor: rollout 副本，负责高吞吐生成 response
+```
+
+训练后 Megatron actor 权重变了。如果不把新权重同步到 vLLM，下一轮 rollout 仍然用旧策略生成，训练就会偏离 on-policy 目标。
+
+`train.py` 因此每轮 train 后调用：
+
+```python
+actor_model.update_weights()
+```
+
+它最终广播到每个 Megatron rank：
+
+```python
+RayTrainGroup.update_weights()
+-> MegatronTrainRayActor.update_weights()
+-> self.weight_updater.update_weights()
+```
+
+本轮 colocate 下 `self.weight_updater` 是：
+
+```text
+/workspace/vime/vime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+UpdateWeightFromTensor
+```
+
+### colocate 权重同步的完整数据流
+
+代码位置：
+
+```text
+/workspace/vime/vime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+UpdateWeightFromTensor.update_weights()
+UpdateWeightFromTensor._send_hf_params()
+_send_to_colocated_engine()
+
+/workspace/vime/vime/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py
+HfWeightIteratorDirect.get_hf_weight_chunks()
+
+/workspace/vime/vime/backends/megatron_utils/update_weight/common.py
+named_params_and_buffers()
+all_gather_params_async()
+
+/workspace/vime/vime/backends/vllm_utils/vllm_engine.py
+VLLMEngine.update_weights_from_tensor()
+```
+
+整体流程：
+
+```text
+Megatron sharded params
+-> collect global param metadata
+-> PP/EP broadcast
+-> TP all-gather full param
+-> convert Megatron names/layout to HF/vLLM names/layout
+-> build CUDA IPC handles
+-> Gloo gather IPC payloads to vLLM slot leader
+-> Ray call VLLMEngine.update_weights_from_tensor()
+-> HTTP POST /update_weights to vLLM server
+```
+
+`UpdateWeightFromTensor.update_weights()` 先让 vLLM 暂停生成并清 cache：
+
+```python
+if rank == 0:
+    ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+    ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+```
+
+然后每个 colocated engine 进入 vLLM weight update mode：
+
+```python
+if self._ipc_engine is not None and rank == self._ipc_gather_src:
+    ray.get(self._ipc_engine.start_weight_update.remote(is_checkpoint_format=True))
+```
+
+接着从 Megatron 取 actor 权重：
+
+```python
+megatron_local_weights = self.weights_getter()
+```
+
+本轮 `weights_getter` 来自：
+
+```python
+weights_getter=lambda: self.weights_backuper.get("actor")
+```
+
+也就是刚训练完并 `backup("actor")` 的 actor 参数。
+
+### Megatron 参数如何变成 HF/vLLM 参数
+
+`HfWeightIteratorDirect.get_hf_weight_chunks()` 是核心：
+
+```python
+for bucket_idx, megatron_local_param_infos in enumerate(self.megatron_local_param_info_buckets, start=1):
+    megatron_full_params = _get_megatron_full_params(megatron_local_param_infos, megatron_local_weights)
+    hf_named_tensors = self._convert_to_hf_named_tensors(megatron_full_params, megatron_local_param_infos)
+    yield hf_named_tensors
+```
+
+为什么要分 bucket：
+
+- Qwen3-30B-A3B 参数很大。
+- 一次性 all-gather + 转 HF + IPC 可能打爆显存。
+- `VIME_UPDATE_WEIGHT_BUFFER_SIZE=134217728` 把每个 bucket 控制在 128MiB 量级。
+- 本轮日志中的 `[weight-sync] bucket ...` 就来自这里。
+
+`_get_megatron_full_params()` 做多级并行收集：
+
+1. 参数只在 `info.src_rank` 上真实存在，其它 rank 创建 empty tensor。
+2. 如果 PP>1，跨 pipeline parallel group broadcast。
+3. 如果 EP>1，expert 参数跨 expert parallel group broadcast。
+4. 恢复 tensor parallel attrs。
+5. 调 `all_gather_params_async()` 跨 TP/ETP all-gather 成完整权重。
+
+```python
+gathered_params = all_gather_params_async(list(zip(megatron_local_param_infos, params, strict=False)))
+```
+
+然后转换成 HF/vLLM 命名：
+
+```python
+hf_named_tensors.extend(
+    convert_to_hf(self.args, self.model_name, info.name, param, self.quantization_config)
+)
+```
+
+本轮对 Qwen3MoE 做了两个关键修正：
+
+1. layernorm 名字兼容：
+
+   ```python
+   rest in {"self_attention.linear_qkv.layer_norm_weight", "input_layernorm.weight"}
+   rest in {"mlp.linear_fc1.layer_norm_weight", "pre_mlp_layernorm.weight", "post_attention_layernorm.weight"}
+   ```
+
+2. grouped expert 权重拆成 per-expert：
+
+   ```python
+   if rest == "mlp.experts.weight1":
+       expert_tensors = param.view(num_local_experts, args.hidden_size, -1).transpose(-1, -2)
+       target = "linear_fc1"
+   elif rest == "mlp.experts.weight2":
+       expert_tensors = param.view(num_local_experts, -1, args.hidden_size).transpose(-1, -2)
+       target = "linear_fc2"
+   ```
+
+原因是 Megatron 训练侧的 grouped MoE 参数布局和 vLLM/HF 推理侧的 per-expert 参数布局不同。如果这里没拆对，vLLM 能收到权重，但专家层语义会错。
+
+### CUDA IPC 到 vLLM
+
+HF named tensors 准备好后：
+
+```python
+refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+ray.get(refs)
+```
+
+colocate 路径进入：
+
+```python
+_send_to_colocated_engine(
+    hf_named_tensors,
+    ipc_engine=self._ipc_engine,
+    ipc_gather_src=self._ipc_gather_src,
+    ipc_gather_group=self._ipc_gather_group,
+    weight_version=self.weight_version,
+)
+```
+
+如果一个 vLLM engine 使用多个 GPU slot，先在 Gloo group 内 gather 每个 rank 的 IPC payload：
+
+```python
+dist.gather_object(payload, object_gather_list=gathered_payloads, dst=ipc_gather_src, group=ipc_gather_group)
+```
+
+slot leader 合并 payload 后调用 vLLM engine：
+
+```python
+ipc_engine.update_weights_from_tensor.remote(**merged, weight_version=str(weight_version))
+```
+
+`VLLMEngine.update_weights_from_tensor()` 再通过 HTTP 调 vLLM server：
+
+```python
+payload = {"names": names, "dtype_names": dtype_names, "shapes": shapes}
+payload["ipc_handles_pickled"] = base64.b64encode(cloudpickle.dumps(ipc_handles)).decode("utf-8")
+result = self._make_request("update_weights", {"update_info": payload})
+self._weight_version = str(weight_version)
+```
+
+也就是说，真正的大 tensor 不通过 Ray object store 拷贝；Ray/HTTP 传的是 CUDA IPC handle 和 metadata，vLLM 进程打开 handle 后读取同 GPU 上的 tensor。
+
+每个 bucket 完成后释放 IPC cache：
+
+```python
+del long_lived_tensors, hf_named_tensors
+torch.cuda.ipc_collect()
+```
+
+所有 bucket 完成后退出 vLLM weight update mode：
+
+```python
+if self._ipc_engine is not None and rank == self._ipc_gather_src:
+    ray.get(self._ipc_engine.finish_weight_update.remote())
+```
+
+最后恢复生成：
+
+```python
+if rank == 0:
+    ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+```
+
+### 分布式权重同步分支
+
+本轮是 colocate，所以主路径是 `UpdateWeightFromTensor`。但代码还支持非 colocate：
+
+```text
+/workspace/vime/vime/backends/megatron_utils/update_weight/update_weight_from_distributed.py
+UpdateWeightFromDistributed
+```
+
+这个分支的思想是：
+
+```text
+Megatron trainer rank 0 + vLLM engine GPUs
+-> 建 NCCLWeightTransferEngine group
+-> Ray 传 metadata
+-> NCCL broadcast tensor 到远端 engine
+```
+
+`UpdateWeightFromTensor` 里也有 mixed colocate/distributed 支持：
+
+```python
+self.use_distribute = len(rollout_engines) > colocate_engine_nums
+```
+
+如果 rollout engines 有一部分不在 actor GPU 范围内，就 colocated engine 走 IPC，剩余 engine 走 distributed NCCL。
+
+### 为什么 T03 baseline 会卡在 wake_up weights
+
+T03 baseline 第一次失败在：
+
+```text
+/wake_up?tags=weights
+ConnectionRefusedError
+```
+
+框架级解释：
+
+1. `train.py` 在 train 后准备更新 rollout 权重。
+2. colocate/offload 模式下先 `rollout_manager.onload_weights()`。
+3. `RolloutServer.onload_weights()` 会对需要 offload 的 server group 调：
+
+   ```python
+   engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+   ```
+
+4. `VLLMEngine.resume_memory_occupation()` HTTP POST 到 vLLM server：
+
+   ```python
+   POST /wake_up?tags=weights
+   ```
+
+5. 如果 vLLM APIServer/EngineCore 已退出，15000 端口无人监听，就会 `ConnectionRefusedError`。
+
+所以这个错误不是 Megatron loss 或 `linear_logp` 本身失败，而是 rollout server 生命周期/残留状态问题。清理 Ray/vLLM/redis 后重跑成功，也符合这个判断。
+
+### 框架级排错顺序
+
+如果后续继续跑 T07 或其它配置，建议按层次排错：
+
+1. Ray 层：
+   - `ray status`
+   - Ray job 是否启动。
+   - placement group 是否 ready。
+   - actor 是否 `DEAD` 或 `PENDING`。
+
+2. vLLM 层：
+   - `/health` 是否 200。
+   - `VLLMEngine` 是否成功 spawn server process。
+   - `CUDA_VISIBLE_DEVICES` 是否对应预期 GPU。
+   - sleep/wake 的 `/sleep`、`/wake_up?tags=weights`、`/wake_up?tags=kv_cache` 是否成功。
+
+3. rollout 数据层：
+   - `RolloutManager.generate()` 是否返回 `Sample`。
+   - `tokens/response_lengths/loss_masks/rewards` 是否长度一致。
+   - `build_dp_schedule()` 是否满足 `RBS*NSP >= DP` 和 `GBS <= RBS*NSP`。
+
+4. Megatron train 层：
+   - `MegatronTrainRayActor._get_rollout_data()` 是否能把数据搬上 GPU。
+   - `train_actor()` 是否能算 advantage/logprob/loss。
+   - `train_one_step()` 是否有 finite loss/grad norm。
+
+5. RL-Kernel 算子层：
+   - 是否出现 `Using RL-Kernel linear_logp op: FusedLinearLogpSM90Op`。
+   - 是否出现 `Using fused-tile bf16 full-gradient tensor-parallel linear_logp fast path.`。
+   - `rl_kernel_fallback_count_delta` 是否为 0。
+
+6. 权重同步层：
+   - `[weight-sync] bucket ... begin/all-gather/HF convert/IPC payload/update returned` 是否连续出现。
+   - vLLM `start_weight_update` / `finish_weight_update` 是否成功。
+   - `weight_version` 是否随 rollout 增长。
+
+7. 显存/offload 层：
+   - rollout 生成后 vLLM 是否 offload。
+   - train 前 Megatron 是否 wake。
+   - train 后 vLLM 是否只先 wake weights，再 update weights，再 wake kv。
+   - `actor_train_peak_reserved_delta_mb` 和 `peak_vram_gb` 是否异常上升。
+
+这个分层视角比只看命令行更适合理解 RL 框架：vime 把“生成”和“训练”拆成两个执行系统，vLLM 负责高吞吐 rollout，Megatron 负责大模型训练，中间通过 Ray object refs 传样本、通过 CUDA IPC/NCCL 同步权重。
+
 ## 已完成结果
 
 T01、T03、T06 都完成了 candidate 与 baseline 的完整 12 轮 no-trace 对比。T07 做过 trace 尝试和一次后续 no-trace 重启，但按用户后续要求已经停止，不纳入正式指标。
