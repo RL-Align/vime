@@ -50,7 +50,7 @@
 
   <rect class="header" x="1000" y="145" width="185" height="58"/>
   <text class="celltext" x="1092.5" y="172" text-anchor="middle">Serving</text>
-  <text class="celltext" x="1092.5" y="193" text-anchor="middle">/ batch</text>
+  <text class="celltext" x="1092.5" y="193" text-anchor="middle">/ layout</text>
 
   <rect class="header" x="1185" y="145" width="305" height="58"/>
   <text class="celltext" x="1337.5" y="181" text-anchor="middle">Measured output</text>
@@ -147,7 +147,7 @@
   <text class="subtext" x="907.5" y="571" text-anchor="middle">if needed</text>
   <rect class="pair" x="1000" y="515" width="185" height="78"/>
   <text class="celltext" x="1092.5" y="548" text-anchor="middle">optional</text>
-  <text class="subtext" x="1092.5" y="571" text-anchor="middle">serving pair</text>
+  <text class="subtext" x="1092.5" y="571" text-anchor="middle">layout pair</text>
   <rect class="metric" x="1185" y="515" width="305" height="78"/>
   <text class="celltext" x="1337.5" y="548" text-anchor="middle">interaction ranking</text>
   <text class="subtext" x="1337.5" y="571" text-anchor="middle">smallest failing pair</text>
@@ -181,5 +181,6 @@
   <text class="legendtext" x="1002" y="747">production: real vime rollout/training config</text>
 
   <text class="formula" x="70" y="806">primary metric: max_abs_dlogp over active response/action tokens</text>
-  <text class="note" x="70" y="837">Rule: semantic identity stays fixed for every row. A silent runtime fallback invalidates the row unless fallback itself is the declared axis under test.</text>
+  <text class="note" x="70" y="837">Rule: semantic identity stays fixed for every row. Batch layout is an explicit axis, not a hidden semantic input.</text>
+  <text class="note" x="70" y="864">A silent runtime fallback invalidates the row unless fallback itself is the declared axis under test.</text>
 </svg>
