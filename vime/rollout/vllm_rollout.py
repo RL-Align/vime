@@ -19,6 +19,11 @@ from vime.backends.vllm_utils.server_control import abort_inflight_requests
 from vime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from vime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from vime.utils.async_utils import run
+from vime.utils.consistency_metadata import (
+    ensure_sample_consistency_metadata,
+    get_consistency_mode,
+    stable_fingerprint,
+)
 from vime.utils.data import Dataset
 from vime.utils.eval_config import EvalDatasetConfig
 from vime.utils.http_utils import get, get_rollout_num_engines, post
@@ -42,6 +47,52 @@ _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
 
 # Re-sweep interval while draining; bounds how long a late straggler can run.
 _ABORT_RESWEEP_INTERVAL_S = 3.0
+
+
+def _iter_samples(node: Sample | list[Any]):
+    if isinstance(node, Sample):
+        yield node
+        return
+    if isinstance(node, list):
+        for item in node:
+            yield from _iter_samples(item)
+
+
+def _refresh_consistency_fingerprint(record: dict[str, Any]) -> None:
+    payload = dict(record)
+    payload.pop("fingerprint", None)
+    record["fingerprint"] = stable_fingerprint(payload)
+
+
+def _annotate_consistency_metadata(
+    args: Namespace,
+    node: Sample | list[Any],
+    *,
+    sampling_params: dict[str, Any],
+    source: str,
+) -> None:
+    if get_consistency_mode(args) == "off":
+        return
+    for sample in _iter_samples(node):
+        old_logp_source = source if sample.rollout_log_probs is not None else None
+        ensure_sample_consistency_metadata(
+            sample,
+            args=args,
+            sampling_params=sampling_params,
+            model_name=getattr(args, "hf_checkpoint", None),
+            old_logp_source=old_logp_source,
+        )
+
+
+def _record_dynamic_sampling_decision(node: Sample | list[Any], *, keep: bool, reason: str | None) -> None:
+    decision = {"keep": bool(keep), "reason": reason}
+    for sample in _iter_samples(node):
+        if sample.metadata is None:
+            sample.metadata = {}
+        sample.metadata["dynamic_sampling"] = decision
+        if sample.consistency_metadata is not None:
+            sample.consistency_metadata["dynamic_sampling"] = decision
+            _refresh_consistency_fingerprint(sample.consistency_metadata)
 
 
 def _coerce_flat_int_token_ids(ids: Any) -> list[int]:
@@ -438,6 +489,7 @@ async def generate_and_rm(
         with state.dp_rank_context() as _:
             # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
             custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+            consistency_source = "custom_generate" if custom_func_path is not None else "vllm_rollout"
 
             if custom_func_path is not None:
                 custom_generate_func = load_function(custom_func_path)
@@ -448,6 +500,13 @@ async def generate_and_rm(
                     sample = await custom_generate_func(args, sample, sampling_params)
             else:
                 sample = await generate(args, sample, sampling_params)
+
+    _annotate_consistency_metadata(
+        args,
+        sample,
+        sampling_params=sampling_params,
+        source=consistency_source,
+    )
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -627,6 +686,12 @@ async def generate_rollout_async(
             all_data.append(group)
 
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
+            if get_consistency_mode(args) != "off":
+                _record_dynamic_sampling_decision(
+                    group,
+                    keep=dynamic_filter_output.keep,
+                    reason=dynamic_filter_output.reason,
+                )
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 state.remaining_batch_size -= 1

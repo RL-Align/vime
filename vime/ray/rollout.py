@@ -22,6 +22,13 @@ GPU_MEMORY_TYPE_WEIGHTS = "weights"
 GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
 from vime.rollout.base_types import call_rollout_fn
 from vime.utils import logging_utils
+from vime.utils.consistency_metadata import (
+    build_batch_layout_fingerprints,
+    get_consistency_mode,
+    raise_for_consistency_metadata_failures,
+    sample_consistency_metadata,
+    validate_samples_consistency_metadata,
+)
 from vime.utils.data import get_source
 from vime.utils.dp_schedule import build_dp_schedule
 from vime.utils.health_monitor import RolloutHealthMonitor
@@ -752,6 +759,13 @@ class RolloutManager:
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
 
+        consistency_mode = get_consistency_mode(self.args)
+        if consistency_mode != "off":
+            validation = validate_samples_consistency_metadata(samples, mode=consistency_mode)
+            train_data["consistency_metadata_validation"] = validation.to_dict()
+            raise_for_consistency_metadata_failures(validation)
+            train_data["consistency_metadata"] = [sample_consistency_metadata(sample) for sample in samples]
+
         # Per-rollout aggregate, precomputed at the step level (where we can
         # see every sample of every rollout) and broadcast per-sample so the
         # per-mb loss reducer uses the correct whole-rollout denominator even
@@ -845,6 +859,15 @@ class RolloutManager:
             rollout_indices=data["rollout_ids"],
         )
 
+        if get_consistency_mode(self.args) != "off" or "consistency_metadata" in data:
+            data["consistency_batch_layout_fingerprints"] = build_batch_layout_fingerprints(
+                data,
+                partitions=partitions,
+                micro_batch_indices=micro_batch_indices,
+                num_microbatches=num_microbatches,
+                global_batch_sizes=global_batch_sizes,
+            )
+
         # Package per-rank rollout_data
         rollout_data_refs = []
         for r in range(dp_size):
@@ -868,6 +891,8 @@ class RolloutManager:
                 "source_names",
                 "prompt",
                 "teacher_log_probs",
+                "consistency_metadata",
+                "consistency_batch_layout_fingerprints",
             ]:
                 if key not in data:
                     continue
@@ -877,6 +902,8 @@ class RolloutManager:
                 if key not in data:
                     continue
                 rollout_data[key] = data[key]
+            if "consistency_metadata_validation" in data:
+                rollout_data["consistency_metadata_validation"] = data["consistency_metadata_validation"]
             rollout_data["global_batch_sizes"] = global_batch_sizes
             rollout_data["num_microbatches"] = num_microbatches
             rollout_data["micro_batch_indices"] = micro_batch_indices[r]
