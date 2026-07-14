@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import sys
 import types
@@ -176,6 +177,134 @@ def test_update_weight_disk_dir_required_for_disk_transport(monkeypatch):
         module.vime_validate_args(args)
 
 
+@pytest.mark.unit
+def test_add_rl_kernel_arguments_registers_controls(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser(add_help=False)
+
+    module.add_rl_kernel_arguments(parser)
+
+    flags = {flag for action in parser._actions for flag in action.option_strings}
+    assert "--rlk-fast" in flags
+    assert "--rlk-consistency" in flags
+    assert "--enable-rl-kernel" in flags
+    assert "--rl-kernel-strict" in flags
+    assert "--rl-kernel-ops" in flags
+
+
+@pytest.mark.unit
+def test_rl_kernel_help_text_describes_orthogonal_controls(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser(add_help=False)
+
+    module.add_rl_kernel_arguments(parser)
+    help_text = " ".join(parser.format_help().split())
+
+    assert "independently from consistency auditing" in help_text
+    assert "independently from fast-path acceleration" in help_text
+
+
+def make_rlk_args(**overrides):
+    values = dict(
+        rlk_fast=None,
+        rlk_consistency=None,
+        enable_rl_kernel=False,
+        rl_kernel_strict=False,
+        rl_kernel_ops=(),
+    )
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+@pytest.mark.unit
+def test_resolve_rlk_mode_defaults_to_native_off(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    monkeypatch.delenv("VIME_RLK_FAST", raising=False)
+    monkeypatch.delenv("VIME_RLK_CONSISTENCY", raising=False)
+    args = make_rlk_args()
+
+    config = module.resolve_rlk_mode_config(args)
+
+    assert config.fast == "off"
+    assert config.consistency == "off"
+    assert config.ops == ()
+    assert args.rlk_fast == "off"
+    assert args.rlk_consistency == "off"
+    assert args.rlk_mode_config == config
+
+
+@pytest.mark.unit
+def test_resolve_rlk_mode_uses_env_aliases(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    monkeypatch.setenv("VIME_RLK_FAST", "strict")
+    monkeypatch.setenv("VIME_RLK_CONSISTENCY", "audit")
+    args = make_rlk_args()
+
+    config = module.resolve_rlk_mode_config(args)
+
+    assert config.fast == "strict"
+    assert config.consistency == "audit"
+
+
+@pytest.mark.unit
+def test_resolve_rlk_mode_cli_overrides_env_and_legacy_flags(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    monkeypatch.setenv("VIME_RLK_FAST", "strict")
+    monkeypatch.setenv("VIME_RLK_CONSISTENCY", "audit")
+    args = make_rlk_args(
+        rlk_fast="off",
+        rlk_consistency="strict",
+        enable_rl_kernel=True,
+        rl_kernel_strict=True,
+        rl_kernel_ops=("linear_logp",),
+    )
+
+    config = module.resolve_rlk_mode_config(args)
+
+    assert config.fast == "off"
+    assert config.consistency == "strict"
+    assert config.ops == ("linear_logp",)
+
+
+@pytest.mark.unit
+def test_resolve_rlk_mode_legacy_enable_maps_to_auto(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    monkeypatch.delenv("VIME_RLK_FAST", raising=False)
+    args = make_rlk_args(enable_rl_kernel=True)
+
+    assert module.resolve_rlk_mode_config(args).fast == "auto"
+
+
+@pytest.mark.unit
+def test_resolve_rlk_mode_legacy_strict_maps_to_strict(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    monkeypatch.delenv("VIME_RLK_FAST", raising=False)
+    args = make_rlk_args(enable_rl_kernel=True, rl_kernel_strict=True)
+
+    assert module.resolve_rlk_mode_config(args).fast == "strict"
+
+
+@pytest.mark.unit
+def test_resolve_rlk_mode_rejects_invalid_env(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    monkeypatch.setenv("VIME_RLK_FAST", "turbo")
+    args = make_rlk_args()
+
+    with pytest.raises(ValueError, match="VIME_RLK_FAST"):
+        module.resolve_rlk_mode_config(args)
+
+
+@pytest.mark.unit
+def test_rl_kernel_ops_parse_comma_allowlist(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser(add_help=False)
+    module.add_rl_kernel_arguments(parser)
+
+    args = parser.parse_args(["--rl-kernel-ops", "linear_logp, logp,,attention"])
+
+    assert args.rl_kernel_ops == ("linear_logp", "logp", "attention")
+
+
 def make_vime_validate_args(**overrides):
     values = dict(
         eval_config=None,
@@ -250,6 +379,11 @@ def make_vime_validate_args(**overrides):
         rollout_max_context_len=None,
         rollout_max_prompt_len=None,
         train_backend="megatron",
+        rlk_fast=None,
+        rlk_consistency=None,
+        enable_rl_kernel=False,
+        rl_kernel_strict=False,
+        rl_kernel_ops=(),
         release_train=False,
         keep_old_actor=False,
         only_train_params_name_list=None,
