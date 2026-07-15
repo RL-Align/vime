@@ -872,6 +872,7 @@ class RolloutManager:
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
+                "metadata",
                 "source_names",
                 "prompt",
                 "teacher_log_probs",

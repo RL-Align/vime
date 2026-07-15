@@ -290,6 +290,7 @@ def log_rollout_data(
                 "global_batch_sizes",
                 "num_microbatches",
                 "micro_batch_indices",
+                "metadata",
                 "source_names",
             ]:
                 continue

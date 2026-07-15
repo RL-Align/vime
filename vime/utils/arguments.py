@@ -1047,6 +1047,17 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "If not set, we will use the logprobs from the actor model."
                 ),
             )
+            parser.add_argument(
+                "--rlk-consistency-mode",
+                "--rl-kernel-consistency-mode",
+                dest="rlk_consistency_mode",
+                choices=["off", "audit", "strict"],
+                default=None,
+                help=(
+                    "RL-Kernel consistency diagnostics mode. 'audit' records native read-only dlogp telemetry "
+                    "without enabling RL-Kernel fast operators; 'strict' currently records the same diagnostics."
+                ),
+            )
             # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
             parser.add_argument(
                 "--use-tis",
