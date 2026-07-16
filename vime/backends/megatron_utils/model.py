@@ -50,6 +50,8 @@ from .loss import get_log_probs_and_entropy, loss_function
 from .model_provider import get_model_provider_func
 from .rl_kernel import (
     get_linear_logp_context_from_model,
+    get_linear_logp_runtime_metadata,
+    get_linear_logp_runtime_log_metrics,
     get_rl_kernel_runtime_counter_delta,
     get_rl_kernel_runtime_counters,
     return_hidden_states_for_linear_logp,
@@ -1085,10 +1087,23 @@ def train(
             if role == "actor" and getattr(args, "enable_rl_kernel", False):
                 runtime_totals = get_rl_kernel_runtime_counters()
                 runtime_delta = get_rl_kernel_runtime_counter_delta()
+                linear_logp_metadata = get_linear_logp_runtime_metadata()
                 for key, value in runtime_totals.items():
                     log_dict[f"train/rl_kernel_{key}_total"] = value
                 for key, value in runtime_delta.items():
                     log_dict[f"train/rl_kernel_{key}_delta"] = value
+                log_dict.update(get_linear_logp_runtime_log_metrics())
+                logger.info(
+                    "RL-Kernel linear_logp runtime_metadata: requested_backend=%s actual_backend=%s "
+                    "backend_id=%s contract_id=%s fallback=%s fallback_reason=%s memory_probe_enabled=%s",
+                    linear_logp_metadata.get("requested_backend"),
+                    linear_logp_metadata.get("actual_backend"),
+                    linear_logp_metadata.get("backend_id"),
+                    linear_logp_metadata.get("contract_id"),
+                    linear_logp_metadata.get("fallback"),
+                    linear_logp_metadata.get("fallback_reason"),
+                    linear_logp_metadata.get("memory_probe_enabled"),
+                )
                 total_calls = runtime_totals.get("linear_logp_call_count", 0.0)
                 delta_calls = runtime_delta.get("linear_logp_call_count", 0.0)
                 log_dict["train/rl_kernel_linear_logp_tokens_per_call_total"] = (

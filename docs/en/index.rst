@@ -43,6 +43,7 @@ vime is built on `slime <https://github.com/THUDM/slime>`_, the RL framework beh
    advanced/pd-disaggregation.md
    advanced/vllm-config.md
    advanced/megatron-config.md
+   advanced/rl-kernel-linear-logp.md
    advanced/arch-support-beyond-megatron.md
 
 .. toctree::

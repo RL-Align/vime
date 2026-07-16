@@ -70,6 +70,7 @@ def _reset_rl_kernel_state():
     rlk_mod._LOGP_OP_LOAD_ERROR = None
     rlk_mod._LINEAR_LOGP_OP = None
     rlk_mod._LINEAR_LOGP_OP_LOAD_ERROR = None
+    rlk_mod._LINEAR_LOGP_SELECTED_BACKEND = None
     rlk_mod._LINEAR_LOGP_SAVE_PROBS_CAST_LOGGED = False
     rlk_mod._WARNED_FALLBACK_REASONS.clear()
     rlk_mod._FALLBACK_COUNTS.clear()
@@ -185,12 +186,90 @@ def test_maybe_compute_linear_logp_passes_tensor_parallel_metadata(monkeypatch):
                 "global_vocab_size": 32,
             },
             "hidden_requires_grad": False,
+            "hidden_dtype": hidden.dtype,
         }
     ]
     counters = rlk_mod.get_rl_kernel_runtime_counters()
     assert counters["linear_logp_call_count"] == 1.0
     assert counters["linear_logp_token_count"] == 6.0
     assert counters["linear_logp_dispatch_elapsed_s"] >= 0.0
+    assert counters["linear_logp_fallback_count"] == 0.0
+
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["requested_backend"] == "auto"
+    assert metadata["actual_backend"] == "_FakeLinearLogpOp"
+    assert metadata["backend_id"] == "rl_kernel.linear_logp.auto._FakeLinearLogpOp"
+    assert metadata["contract_id"] is None
+    assert metadata["fallback"] is False
+    assert metadata["fallback_reason"] is None
+    assert metadata["backend_descriptor_id"] > 0
+    assert metadata["contract_descriptor_id"] == 0.0
+    assert metadata["fallback_reason_descriptor_id"] == 0.0
+
+    log_metrics = rlk_mod.get_linear_logp_runtime_log_metrics(prefix="x/")
+    assert log_metrics["x/fallback"] == 0.0
+    assert log_metrics["x/backend_descriptor_id"] == metadata["backend_descriptor_id"]
+    assert log_metrics["x/contract_descriptor_id"] == 0.0
+    assert log_metrics["x/fallback_reason_descriptor_id"] == 0.0
+    assert all("memory_" not in key for key in log_metrics)
+
+
+@pytest.mark.unit
+def test_linear_logp_runtime_metadata_uses_backend_contract_attrs(monkeypatch):
+    class AttrLinearLogpOp(_FakeLinearLogpOp):
+        backend_id = "rlk.linear_logp.fake"
+        contract_id = "rlk.linear_logp.fake.fp32"
+
+    rl_engine = types.ModuleType("rl_engine")
+    kernels = types.ModuleType("rl_engine.kernels")
+    registry = types.ModuleType("rl_engine.kernels.registry")
+    registry.kernel_registry = types.SimpleNamespace(get_op=lambda name: AttrLinearLogpOp())
+    monkeypatch.setitem(sys.modules, "rl_engine", rl_engine)
+    monkeypatch.setitem(sys.modules, "rl_engine.kernels", kernels)
+    monkeypatch.setitem(sys.modules, "rl_engine.kernels.registry", registry)
+
+    args = _make_args()
+    hidden = torch.randn(2, 3)
+    weight = torch.randn(5, 3)
+    target = torch.randint(0, 5, (2,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None)
+
+    rlk_mod.maybe_compute_linear_logp(hidden, target, context=context, args=args, with_entropy=False)
+
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["actual_backend"] == "AttrLinearLogpOp"
+    assert metadata["backend_id"] == "rlk.linear_logp.fake"
+    assert metadata["contract_id"] == "rlk.linear_logp.fake.fp32"
+    assert metadata["backend_descriptor_id"] > 0
+    assert metadata["contract_descriptor_id"] > 0
+
+
+@pytest.mark.unit
+def test_linear_logp_full_gradient_path_matches_materialized_logits(monkeypatch):
+    _install_fake_rl_engine(monkeypatch)
+    args = _make_args()
+    torch.manual_seed(11)
+    hidden = torch.randn(5, 4, requires_grad=True)
+    weight = torch.randn(7, 4, requires_grad=True)
+    bias = torch.randn(7, requires_grad=True)
+    target = torch.randint(0, 7, (5,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=bias, tp_group=None)
+
+    actual = rlk_mod.maybe_compute_linear_logp(hidden, target, context=context, args=args, with_entropy=False)
+    actual_loss = actual.sum()
+    actual_loss.backward()
+    actual_grads = (hidden.grad.clone(), weight.grad.clone(), bias.grad.clone())
+
+    hidden_ref = hidden.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    bias_ref = bias.detach().clone().requires_grad_(True)
+    expected = _reference_logp(hidden_ref, weight_ref, target, bias_ref)
+    expected.sum().backward()
+
+    torch.testing.assert_close(actual.detach(), expected.detach(), rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_grads[0], hidden_ref.grad, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_grads[1], weight_ref.grad, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_grads[2], bias_ref.grad, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.unit
@@ -215,6 +294,27 @@ def test_linear_logp_runtime_counter_delta_tracks_since_last_read(monkeypatch):
     assert second_delta["linear_logp_token_count"] == 2.0
     assert totals["linear_logp_call_count"] == 2.0
     assert totals["linear_logp_token_count"] == 4.0
+
+
+@pytest.mark.unit
+def test_linear_logp_zero_tokens_reports_non_fallback_decision(monkeypatch):
+    _install_fake_rl_engine(monkeypatch)
+    args = _make_args()
+    hidden = torch.randn(0, 3)
+    weight = torch.randn(5, 3)
+    target = torch.empty(0, dtype=torch.long)
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None)
+
+    actual = rlk_mod.maybe_compute_linear_logp(hidden, target, context=context, args=args, with_entropy=False)
+
+    assert actual.shape == (0,)
+    counters = rlk_mod.get_rl_kernel_runtime_counters()
+    assert counters["linear_logp_call_count"] == 0.0
+    assert counters["linear_logp_fallback_count"] == 0.0
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["actual_backend"] == "vime.linear_logp.zero_tokens"
+    assert metadata["fallback"] is False
+    assert metadata["fallback_reason"] is None
 
 
 @pytest.mark.unit
@@ -326,6 +426,20 @@ def test_linear_logp_materializes_logits_fallback_when_optional_package_missing(
         offset += total_length
 
     assert rlk_mod.get_rl_kernel_fallback_count("linear_logp") == 1
+    counters = rlk_mod.get_rl_kernel_runtime_counters()
+    assert counters["linear_logp_fallback_count"] == 1.0
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["actual_backend"] == "vime.native.linear_logp"
+    assert metadata["backend_id"] == "vime.native.linear_logp"
+    assert metadata["contract_id"] == "vime.native.linear_logp.selected_logprob"
+    assert metadata["fallback"] is True
+    assert "No module named 'rl_engine'" in metadata["fallback_reason"]
+    assert metadata["fallback_reason_descriptor_id"] > 0
+    log_metrics = rlk_mod.get_linear_logp_runtime_log_metrics(prefix="x/")
+    assert log_metrics["x/fallback"] == 1.0
+    assert log_metrics["x/backend_descriptor_id"] == metadata["backend_descriptor_id"]
+    assert log_metrics["x/contract_descriptor_id"] == metadata["contract_descriptor_id"]
+    assert log_metrics["x/fallback_reason_descriptor_id"] == metadata["fallback_reason_descriptor_id"]
     for actual, expected_item in zip(result["log_probs"], expected, strict=True):
         torch.testing.assert_close(actual, expected_item, rtol=1e-6, atol=1e-6)
 
@@ -349,6 +463,31 @@ def test_linear_logp_falls_back_when_op_lacks_tp_interface(monkeypatch):
 
     assert actual is None
     assert rlk_mod.get_rl_kernel_fallback_count("linear_logp") == 1
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["fallback"] is True
+    assert metadata["actual_backend"] == "vime.native.linear_logp"
+    assert "unexpected keyword argument" in metadata["fallback_reason"]
+
+
+@pytest.mark.unit
+def test_linear_logp_support_matrix_documents_issue20_fields():
+    matrix = rlk_mod.get_linear_logp_support_matrix()
+    assert matrix
+
+    required_fields = {
+        "backend",
+        "implementation",
+        "dtype",
+        "hardware",
+        "tp",
+        "cp",
+        "entropy",
+        "full_gradient",
+    }
+    assert all(required_fields <= set(row) for row in matrix)
+    assert {row["backend"] for row in matrix} >= {"cuda_sm90", "triton", "registry", "native"}
+    assert any("FusedLinearLogpSM90Op" in row["implementation"] for row in matrix)
+    assert any("native" in row["backend"] and "Megatron" in row["implementation"] for row in matrix)
 
 
 @pytest.mark.unit

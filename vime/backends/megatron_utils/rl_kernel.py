@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
 from argparse import Namespace
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import torch
@@ -22,6 +23,7 @@ _LOGP_OP = None
 _LOGP_OP_LOAD_ERROR: Exception | None = None
 _LINEAR_LOGP_OP = None
 _LINEAR_LOGP_OP_LOAD_ERROR: Exception | None = None
+_LINEAR_LOGP_SELECTED_BACKEND: str | None = None
 _WARNED_FALLBACK_REASONS: set[str] = set()
 _FALLBACK_COUNTS: dict[str, int] = {"logp": 0, "linear_logp": 0}
 _LINEAR_LOGP_SAVE_PROBS_CAST_LOGGED = False
@@ -29,6 +31,7 @@ _RUNTIME_COUNTER_KEYS = (
     "linear_logp_call_count",
     "linear_logp_token_count",
     "linear_logp_dispatch_elapsed_s",
+    "linear_logp_fallback_count",
     "linear_logp_forward_cuda_event_count",
     "linear_logp_forward_cuda_event_elapsed_s",
     "linear_logp_forward_backward_cuda_event_count",
@@ -37,6 +40,69 @@ _RUNTIME_COUNTER_KEYS = (
 _RUNTIME_COUNTERS: dict[str, float] = dict.fromkeys(_RUNTIME_COUNTER_KEYS, 0.0)
 _RUNTIME_COUNTER_LAST_SNAPSHOT: dict[str, float] = dict.fromkeys(_RUNTIME_COUNTER_KEYS, 0.0)
 _CUDA_EVENT_TIMER_QUEUE = CudaEventTimerQueue()
+_NATIVE_LINEAR_LOGP_BACKEND = "vime.native.linear_logp"
+_ZERO_TOKEN_LINEAR_LOGP_BACKEND = "vime.linear_logp.zero_tokens"
+_LINEAR_LOGP_SUPPORT_MATRIX: tuple[dict[str, str], ...] = (
+    {
+        "backend": "cuda_sm90",
+        "implementation": "FusedLinearLogpSM90Op",
+        "dtype": "bf16 inputs, fp32 selected logprob output",
+        "hardware": "NVIDIA SM90/Hopper CUDA build with RL-Kernel extension",
+        "tp": "supported through tp_group, vocab_start_index, global_vocab_size",
+        "cp": "not supported; falls back before CP redistribution",
+        "entropy": "not supported; falls back when entropy is requested",
+        "full_gradient": "supported when the installed RL-Kernel op saves backward state",
+    },
+    {
+        "backend": "triton",
+        "implementation": "TritonLinearLogpOp",
+        "dtype": "backend-defined floating input/output contract",
+        "hardware": "CUDA devices supported by the installed Triton backend",
+        "tp": "supported only when the op accepts TP metadata",
+        "cp": "not supported; falls back before CP redistribution",
+        "entropy": "not supported; falls back when entropy is requested",
+        "full_gradient": "backend-defined; strict/full-gradient runs should validate saved-state support",
+    },
+    {
+        "backend": "registry",
+        "implementation": "kernel_registry.get_op('linear_logp')",
+        "dtype": "reported by the selected RL-Kernel backend",
+        "hardware": "reported by the selected RL-Kernel backend",
+        "tp": "supported only when the selected op accepts TP metadata",
+        "cp": "not supported; falls back before CP redistribution",
+        "entropy": "not supported; falls back when entropy is requested",
+        "full_gradient": "reported by the selected RL-Kernel backend",
+    },
+    {
+        "backend": "native",
+        "implementation": "Megatron output layer + vime calculate_log_probs_and_entropy",
+        "dtype": "vime native logits path, fp32 logprob computation",
+        "hardware": "same as native vime/Megatron execution",
+        "tp": "supported by the native vime/Megatron logprob path",
+        "cp": "supported by the native vime/Megatron CP redistribution path",
+        "entropy": "supported by the native vime/Megatron path",
+        "full_gradient": "supported by native autograd over materialized logits",
+    },
+)
+
+
+@dataclass
+class LinearLogpRuntimeMetadata:
+    operator: str = "linear_logp"
+    requested_backend: str = "auto"
+    actual_backend: str = "not_selected"
+    backend_id: str | None = None
+    contract_id: str | None = None
+    fallback: bool = False
+    fallback_reason: str | None = None
+    memory_probe_enabled: bool = False
+    memory_alloc_delta_mb: float | None = None
+    memory_peak_alloc_delta_mb: float | None = None
+    memory_reserved_delta_mb: float | None = None
+    memory_peak_reserved_delta_mb: float | None = None
+
+
+_LINEAR_LOGP_RUNTIME_METADATA = LinearLogpRuntimeMetadata()
 
 
 def _env_flag(name: str) -> bool:
@@ -53,6 +119,148 @@ def _env_bool(name: str) -> bool | None:
     if lowered in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean flag, got {value!r}")
+
+
+def _requested_linear_logp_backend() -> str:
+    requested = os.getenv("VIME_RL_KERNEL_LINEAR_LOGP_BACKEND", "").strip().lower()
+    aliases = {
+        "": "auto",
+        "auto": "auto",
+        "registry": "registry",
+        "triton": "triton",
+        "triton_linear_logp": "triton",
+        "cuda": "cuda_sm90",
+        "sm90": "cuda_sm90",
+        "cuda_sm90": "cuda_sm90",
+        "fused_sm90": "cuda_sm90",
+    }
+    return aliases.get(requested, requested)
+
+
+def _stable_descriptor_id(value: str | None) -> float:
+    if not value:
+        return 0.0
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+    return float(int(digest, 16))
+
+
+def _op_text_attr(op: Any, *names: str) -> str | None:
+    for name in names:
+        value = getattr(op, name, None)
+        if value is None:
+            continue
+        if callable(value):
+            try:
+                value = value()
+            except TypeError:
+                continue
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _op_backend_metadata(op: Any, selected_backend: str) -> tuple[str, str | None, str | None]:
+    implementation = type(op).__name__
+    backend_id = _op_text_attr(op, "backend_id", "backend_name", "name")
+    contract_id = _op_text_attr(op, "contract_id", "numeric_contract_id")
+    if backend_id is None:
+        backend_id = f"rl_kernel.linear_logp.{selected_backend}.{implementation}"
+    return implementation, backend_id, contract_id
+
+
+def _reset_linear_logp_runtime_metadata() -> None:
+    global _LINEAR_LOGP_RUNTIME_METADATA
+    _LINEAR_LOGP_RUNTIME_METADATA = LinearLogpRuntimeMetadata(
+        requested_backend=_requested_linear_logp_backend(),
+    )
+
+
+def _clear_linear_logp_memory_metadata() -> None:
+    _LINEAR_LOGP_RUNTIME_METADATA.memory_probe_enabled = False
+    _LINEAR_LOGP_RUNTIME_METADATA.memory_alloc_delta_mb = None
+    _LINEAR_LOGP_RUNTIME_METADATA.memory_peak_alloc_delta_mb = None
+    _LINEAR_LOGP_RUNTIME_METADATA.memory_reserved_delta_mb = None
+    _LINEAR_LOGP_RUNTIME_METADATA.memory_peak_reserved_delta_mb = None
+
+
+def _set_linear_logp_fallback(reason: str) -> None:
+    _clear_linear_logp_memory_metadata()
+    _LINEAR_LOGP_RUNTIME_METADATA.requested_backend = _requested_linear_logp_backend()
+    _LINEAR_LOGP_RUNTIME_METADATA.actual_backend = _NATIVE_LINEAR_LOGP_BACKEND
+    _LINEAR_LOGP_RUNTIME_METADATA.backend_id = _NATIVE_LINEAR_LOGP_BACKEND
+    _LINEAR_LOGP_RUNTIME_METADATA.contract_id = "vime.native.linear_logp.selected_logprob"
+    _LINEAR_LOGP_RUNTIME_METADATA.fallback = True
+    _LINEAR_LOGP_RUNTIME_METADATA.fallback_reason = reason
+
+
+def _set_linear_logp_selected_backend(op: Any, selected_backend: str) -> None:
+    _clear_linear_logp_memory_metadata()
+    implementation, backend_id, contract_id = _op_backend_metadata(op, selected_backend)
+    _LINEAR_LOGP_RUNTIME_METADATA.requested_backend = _requested_linear_logp_backend()
+    _LINEAR_LOGP_RUNTIME_METADATA.actual_backend = implementation
+    _LINEAR_LOGP_RUNTIME_METADATA.backend_id = backend_id
+    _LINEAR_LOGP_RUNTIME_METADATA.contract_id = contract_id
+    _LINEAR_LOGP_RUNTIME_METADATA.fallback = False
+    _LINEAR_LOGP_RUNTIME_METADATA.fallback_reason = None
+
+
+def _set_linear_logp_zero_token_decision() -> None:
+    _clear_linear_logp_memory_metadata()
+    _LINEAR_LOGP_RUNTIME_METADATA.requested_backend = _requested_linear_logp_backend()
+    _LINEAR_LOGP_RUNTIME_METADATA.actual_backend = _ZERO_TOKEN_LINEAR_LOGP_BACKEND
+    _LINEAR_LOGP_RUNTIME_METADATA.backend_id = _ZERO_TOKEN_LINEAR_LOGP_BACKEND
+    _LINEAR_LOGP_RUNTIME_METADATA.contract_id = None
+    _LINEAR_LOGP_RUNTIME_METADATA.fallback = False
+    _LINEAR_LOGP_RUNTIME_METADATA.fallback_reason = None
+
+
+def _record_linear_logp_memory_probe(
+    *,
+    alloc_before: int,
+    alloc_after: int,
+    peak_alloc: int,
+    reserved_before: int,
+    reserved_after: int,
+    peak_reserved: int,
+) -> None:
+    mb = float(1024**2)
+    _LINEAR_LOGP_RUNTIME_METADATA.memory_probe_enabled = True
+    _LINEAR_LOGP_RUNTIME_METADATA.memory_alloc_delta_mb = (alloc_after - alloc_before) / mb
+    _LINEAR_LOGP_RUNTIME_METADATA.memory_peak_alloc_delta_mb = (peak_alloc - alloc_before) / mb
+    _LINEAR_LOGP_RUNTIME_METADATA.memory_reserved_delta_mb = (reserved_after - reserved_before) / mb
+    _LINEAR_LOGP_RUNTIME_METADATA.memory_peak_reserved_delta_mb = (peak_reserved - reserved_before) / mb
+
+
+def get_linear_logp_support_matrix() -> tuple[dict[str, str], ...]:
+    return tuple(dict(row) for row in _LINEAR_LOGP_SUPPORT_MATRIX)
+
+
+def get_linear_logp_runtime_metadata() -> dict[str, Any]:
+    metadata = asdict(_LINEAR_LOGP_RUNTIME_METADATA)
+    metadata["backend_descriptor_id"] = _stable_descriptor_id(metadata.get("backend_id"))
+    metadata["contract_descriptor_id"] = _stable_descriptor_id(metadata.get("contract_id"))
+    metadata["fallback_reason_descriptor_id"] = _stable_descriptor_id(metadata.get("fallback_reason"))
+    return metadata
+
+
+def get_linear_logp_runtime_log_metrics(prefix: str = "train/rl_kernel_linear_logp_") -> dict[str, float]:
+    metadata = get_linear_logp_runtime_metadata()
+    metrics = {
+        f"{prefix}fallback": 1.0 if metadata.get("fallback") else 0.0,
+        f"{prefix}backend_descriptor_id": float(metadata["backend_descriptor_id"]),
+        f"{prefix}contract_descriptor_id": float(metadata["contract_descriptor_id"]),
+        f"{prefix}fallback_reason_descriptor_id": float(metadata["fallback_reason_descriptor_id"]),
+    }
+    for key in (
+        "memory_alloc_delta_mb",
+        "memory_peak_alloc_delta_mb",
+        "memory_reserved_delta_mb",
+        "memory_peak_reserved_delta_mb",
+    ):
+        value = metadata.get(key)
+        if value is not None:
+            metrics[f"{prefix}{key}"] = float(value)
+    return metrics
 
 
 @dataclass(frozen=True)
@@ -76,6 +284,7 @@ def reset_rl_kernel_runtime_counters() -> None:
     for key in _RUNTIME_COUNTER_KEYS:
         _RUNTIME_COUNTERS[key] = 0.0
         _RUNTIME_COUNTER_LAST_SNAPSHOT[key] = 0.0
+    _reset_linear_logp_runtime_metadata()
 
 
 def get_rl_kernel_runtime_counters() -> dict[str, float]:
@@ -187,6 +396,9 @@ def _register_linear_logp_backward_event_timer(
 
 def _warn_fallback(args: Namespace, op: str, reason: str) -> None:
     _FALLBACK_COUNTS[op] = _FALLBACK_COUNTS.get(op, 0) + 1
+    if op == "linear_logp":
+        _RUNTIME_COUNTERS["linear_logp_fallback_count"] += 1.0
+        _set_linear_logp_fallback(reason)
     if getattr(args, "rl_kernel_strict", False):
         raise RuntimeError(f"RL-Kernel {op} is enabled but unavailable: {reason}")
     warning_key = f"{op}: {reason}"
@@ -216,32 +428,35 @@ def _get_logp_op(args: Namespace):
 
 
 def _get_linear_logp_op(args: Namespace):
-    global _LINEAR_LOGP_OP, _LINEAR_LOGP_OP_LOAD_ERROR
+    global _LINEAR_LOGP_OP, _LINEAR_LOGP_OP_LOAD_ERROR, _LINEAR_LOGP_SELECTED_BACKEND
     if _LINEAR_LOGP_OP is not None:
+        _set_linear_logp_selected_backend(_LINEAR_LOGP_OP, _LINEAR_LOGP_SELECTED_BACKEND or "registry")
         return _LINEAR_LOGP_OP
     if _LINEAR_LOGP_OP_LOAD_ERROR is not None:
         _warn_fallback(args, "linear_logp", str(_LINEAR_LOGP_OP_LOAD_ERROR))
         return None
 
     try:
-        forced_backend = os.getenv("VIME_RL_KERNEL_LINEAR_LOGP_BACKEND", "").strip().lower()
-        if forced_backend in {"triton", "triton_linear_logp"}:
+        forced_backend = _requested_linear_logp_backend()
+        if forced_backend == "triton":
             from rl_engine.kernels.ops.triton.loss.linear_logp import TritonLinearLogpOp
 
             _LINEAR_LOGP_OP = TritonLinearLogpOp()
-        elif forced_backend in {"cuda", "sm90", "cuda_sm90", "fused_sm90"}:
+        elif forced_backend == "cuda_sm90":
             from rl_engine.kernels.ops.cuda.loss.linear_logp import FusedLinearLogpSM90Op
 
             _LINEAR_LOGP_OP = FusedLinearLogpSM90Op()
-        elif forced_backend in {"", "auto", "registry"}:
+        elif forced_backend in {"auto", "registry"}:
             from rl_engine.kernels.registry import kernel_registry
 
             _LINEAR_LOGP_OP = kernel_registry.get_op("linear_logp")
         else:
             raise ValueError(
                 "unknown VIME_RL_KERNEL_LINEAR_LOGP_BACKEND="
-                f"{forced_backend!r}; expected triton, cuda, or registry"
+                f"{forced_backend!r}; expected triton, cuda, sm90, auto, or registry"
             )
+        _LINEAR_LOGP_SELECTED_BACKEND = forced_backend
+        _set_linear_logp_selected_backend(_LINEAR_LOGP_OP, forced_backend)
         logger.info("Using RL-Kernel linear_logp op: %s", type(_LINEAR_LOGP_OP).__name__)
         return _LINEAR_LOGP_OP
     except Exception as exc:  # pragma: no cover - exercised with missing optional package in integration envs
@@ -461,6 +676,7 @@ def maybe_compute_linear_logp(
         return None
 
     if target_ids.numel() == 0:
+        _set_linear_logp_zero_token_decision()
         return hidden_states.new_zeros((0,), dtype=torch.float32)
 
     op = _get_linear_logp_op(args)
@@ -506,6 +722,7 @@ def maybe_compute_linear_logp(
         _warn_fallback(args, "linear_logp", str(exc))
         return None
 
+    _set_linear_logp_selected_backend(op, _LINEAR_LOGP_SELECTED_BACKEND or _requested_linear_logp_backend())
     _record_linear_logp_runtime(target_ids.numel(), time.perf_counter() - start_s)
 
     if event_timer and forward_start_event is not None:
@@ -530,6 +747,14 @@ def maybe_compute_linear_logp(
         probe_after_reserved = torch.cuda.memory_reserved(probe_device)
         probe_peak_alloc = torch.cuda.max_memory_allocated(probe_device)
         probe_peak_reserved = torch.cuda.max_memory_reserved(probe_device)
+        _record_linear_logp_memory_probe(
+            alloc_before=probe_before_alloc,
+            alloc_after=probe_after_alloc,
+            peak_alloc=probe_peak_alloc,
+            reserved_before=probe_before_reserved,
+            reserved_after=probe_after_reserved,
+            peak_reserved=probe_peak_reserved,
+        )
         update_peak_memory_tracker(
             "actor_train",
             peak_alloc=probe_peak_alloc,
