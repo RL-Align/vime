@@ -101,6 +101,8 @@ def resolve_rlk_mode_config(args):
     ops = _parse_rl_kernel_ops(getattr(args, "rl_kernel_ops", ()))
 
     config = RlkModeConfig(fast=fast, consistency=consistency, ops=ops)
+    # Compatibility aliases for existing callers; new code should prefer the
+    # immutable args.rlk_mode_config so resolved mode state has one owner.
     args.rlk_fast = fast
     args.rlk_consistency = consistency
     args.rl_kernel_ops = ops
@@ -1634,6 +1636,8 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
 
         parser = add_cluster_arguments(parser)
         parser = add_train_arguments(parser)
+        # Production parser path: RL-Kernel controls are framework-level vime
+        # flags, not CI-only switches.
         parser = add_rl_kernel_arguments(parser)
         parser = add_rollout_arguments(parser)
         parser = add_fault_tolerance_arguments(parser)

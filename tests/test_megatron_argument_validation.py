@@ -193,6 +193,30 @@ def test_add_rl_kernel_arguments_registers_controls(monkeypatch):
 
 
 @pytest.mark.unit
+def test_standard_vime_parser_registers_rl_kernel_controls(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser(add_help=False)
+
+    module.get_vime_extra_args_provider()(parser)
+    args = parser.parse_args(
+        [
+            "--rlk-fast",
+            "auto",
+            "--rlk-consistency",
+            "audit",
+            "--rl-kernel-ops",
+            "linear_logp,logp",
+            "--rollout-batch-size",
+            "8",
+        ]
+    )
+
+    assert args.rlk_fast == "auto"
+    assert args.rlk_consistency == "audit"
+    assert args.rl_kernel_ops == ("linear_logp", "logp")
+
+
+@pytest.mark.unit
 def test_rl_kernel_help_text_describes_orthogonal_controls(monkeypatch):
     module = load_vime_arguments_module(monkeypatch)
     parser = argparse.ArgumentParser(add_help=False)
