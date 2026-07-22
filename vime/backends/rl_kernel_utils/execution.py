@@ -1,12 +1,26 @@
+import hashlib
 import json
 import logging
-from dataclasses import asdict, dataclass, field
-from typing import Any
+import os
+from dataclasses import asdict, dataclass, field, fields
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
 RLK_DECISION_EVENT = "rl_kernel.execution_decision"
 _NATIVE_BACKEND_ID = "vime.native"
+
+ExecutionDecisionKind = Literal[
+    "native",
+    "audit-only",
+    "optimized",
+    "strict-fast",
+    "strict-reference",
+    "fallback-native",
+    "strict-failure",
+    "contract-match",
+    "audit-warning",
+]
 
 
 @dataclass(frozen=True)
@@ -109,7 +123,7 @@ class ExecutionDecision:
     requested_mode: str
     requested_backend: str | None
     actual_backend: str | None
-    decision: str
+    decision: ExecutionDecisionKind
     fallback: bool = False
     fallback_reason: FallbackReason | None = None
     capability_backend_id: str | None = None
@@ -162,15 +176,20 @@ def _normalize_backend(value: Any) -> BackendCapability:
     if isinstance(value, BackendCapability):
         return value
     if isinstance(value, dict):
-        data = dict(value)
+        data = _filter_dataclass_fields(value, BackendCapability)
         contract = data.get("numeric_contract")
         if isinstance(contract, dict):
-            data["numeric_contract"] = NumericContract(**contract)
+            data["numeric_contract"] = NumericContract(**_filter_dataclass_fields(contract, NumericContract))
         for key in ("dtypes", "hardware_targets", "autograd_modes", "parallel_modes"):
             if key in data and isinstance(data[key], list):
                 data[key] = tuple(data[key])
         return BackendCapability(**data)
     raise TypeError(f"unsupported RL-Kernel backend descriptor {type(value)!r}")
+
+
+def _filter_dataclass_fields(data: dict[str, Any], target: type[Any]) -> dict[str, Any]:
+    allowed = {field.name for field in fields(target)}
+    return {key: value for key, value in data.items() if key in allowed}
 
 
 def query_rl_kernel_capabilities(provider: Any = None) -> CapabilityQueryResult:
@@ -193,6 +212,7 @@ def query_rl_kernel_capabilities(provider: Any = None) -> CapabilityQueryResult:
             raw_capabilities = provider
         capabilities = _normalize_caps(raw_capabilities)
     except Exception as exc:
+        logger.debug("Provider query failed", exc_info=True)
         reason = FallbackReason(
             code="capability_query_failed",
             message="Failed to query RL-Kernel capabilities.",
@@ -369,7 +389,7 @@ def _backend_decision(
     dtype: str | None,
     parallel_context: dict[str, Any],
     backend: BackendCapability,
-    decision: str,
+    decision: ExecutionDecisionKind,
 ) -> ExecutionDecision:
     return ExecutionDecision(
         operator=operator,
@@ -499,17 +519,43 @@ def _contract_problem_decision(
     strict: bool,
     reason: FallbackReason,
 ) -> ExecutionDecision:
+    decision: ExecutionDecisionKind = "strict-failure" if strict else "audit-warning"
     return ExecutionDecision(
         operator=operator,
         stage=stage,
         requested_mode="contract-check",
         requested_backend=None,
         actual_backend=None if strict else _NATIVE_BACKEND_ID,
-        decision="strict-failure" if strict else "audit-warning",
+        decision=decision,
         fallback=False,
         fallback_reason=reason,
         details=reason.details,
     )
+
+
+def execution_decision_sample_value(
+    *,
+    seed: int | str = 0,
+    rank: int | None = None,
+    key: str = "",
+) -> float:
+    """Return a deterministic sample value in [0, 1) that is partitioned by rank."""
+    rank = _current_process_rank() if rank is None else rank
+    payload = f"{seed}\0{rank}\0{key}".encode()
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, "big") / 2**64
+
+
+def _current_process_rank() -> int:
+    for env_name in ("RANK", "LOCAL_RANK"):
+        value = os.environ.get(env_name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            logger.debug("Ignoring non-integer %s=%r while sampling RL-Kernel decision logs.", env_name, value)
+    return 0
 
 
 def emit_execution_decision(
@@ -518,9 +564,18 @@ def emit_execution_decision(
     log: logging.Logger | None = None,
     enabled: bool = True,
     sample_rate: float = 1.0,
-    random_value: float = 0.0,
+    random_value: float | None = None,
+    sample_seed: int | str = 0,
+    sample_rank: int | None = None,
+    sample_key: str | None = None,
 ) -> dict[str, Any]:
     record = decision.to_log_record()
+    if random_value is None:
+        random_value = execution_decision_sample_value(
+            seed=sample_seed,
+            rank=sample_rank,
+            key=sample_key or json.dumps(record, sort_keys=True, default=str),
+        )
     if not enabled or sample_rate <= 0 or random_value >= sample_rate:
         return record
 

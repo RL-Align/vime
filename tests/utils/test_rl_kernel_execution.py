@@ -11,6 +11,7 @@ from vime.backends.rl_kernel_utils import (
     RlKernelCapabilities,
     build_logprob_contract_decision,
     emit_execution_decision,
+    execution_decision_sample_value,
     query_rl_kernel_capabilities,
     select_execution_decision,
 )
@@ -270,15 +271,46 @@ def test_query_capabilities_normalizes_dict_provider():
 
 
 @pytest.mark.unit
-def test_query_capabilities_provider_failure_is_structured():
+def test_query_capabilities_filters_unknown_backend_fields():
+    result = query_rl_kernel_capabilities(
+        lambda: {
+            "available": True,
+            "backends": [
+                {
+                    "operator": "linear_logp",
+                    "backend_id": "rlk.linear_logp.fast",
+                    "implementation_kind": "optimized",
+                    "dtypes": ["bf16"],
+                    "unknown_backend_key": "ignored",
+                    "numeric_contract": {
+                        "contract_id": "rlk.linear_logp.fp32",
+                        "tolerance_by_dtype": {"bf16": {"source": "provider"}},
+                        "unknown_contract_key": "ignored",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert result.fallback_reason is None
+    assert result.capabilities.available is True
+    assert result.capabilities.backends[0].backend_id == "rlk.linear_logp.fast"
+    assert result.capabilities.backends[0].dtypes == ("bf16",)
+    assert result.capabilities.backends[0].numeric_contract.contract_id == "rlk.linear_logp.fp32"
+
+
+@pytest.mark.unit
+def test_query_capabilities_provider_failure_is_structured_and_debug_logged(caplog):
     def provider():
         raise RuntimeError("boom")
 
-    result = query_rl_kernel_capabilities(provider)
+    with caplog.at_level(logging.DEBUG, logger="vime.backends.rl_kernel_utils.execution"):
+        result = query_rl_kernel_capabilities(provider)
 
     assert result.capabilities.available is False
     assert result.fallback_reason.code == "capability_query_failed"
     assert "boom" in result.fallback_reason.details["error"]
+    assert any(record.message == "Provider query failed" and record.exc_info is not None for record in caplog.records)
 
 
 @pytest.mark.unit
@@ -417,3 +449,33 @@ def test_emit_execution_decision_can_be_disabled_or_sampled_out(caplog):
     assert record["decision"] == "native"
     assert sampled["decision"] == "native"
     assert caplog.records == []
+
+
+@pytest.mark.unit
+def test_execution_decision_sample_value_is_rank_specific_and_stable():
+    rank0 = execution_decision_sample_value(seed="run-1", rank=0, key="linear_logp")
+    rank1 = execution_decision_sample_value(seed="run-1", rank=1, key="linear_logp")
+
+    assert 0 <= rank0 < 1
+    assert 0 <= rank1 < 1
+    assert rank0 == execution_decision_sample_value(seed="run-1", rank=0, key="linear_logp")
+    assert rank0 != rank1
+
+
+@pytest.mark.unit
+def test_emit_execution_decision_can_sample_with_rank_specific_values(caplog):
+    decision = select_execution_decision(operator="linear_logp", stage="train_logprob")
+    sample_key = "same-event"
+    rank0 = execution_decision_sample_value(seed="run-1", rank=0, key=sample_key)
+    rank1 = execution_decision_sample_value(seed="run-1", rank=1, key=sample_key)
+    sample_rate = (rank0 + rank1) / 2
+
+    with caplog.at_level(logging.INFO, logger="vime.backends.rl_kernel_utils.execution"):
+        emit_execution_decision(
+            decision, sample_rate=sample_rate, sample_seed="run-1", sample_rank=0, sample_key=sample_key
+        )
+        emit_execution_decision(
+            decision, sample_rate=sample_rate, sample_seed="run-1", sample_rank=1, sample_key=sample_key
+        )
+
+    assert len(caplog.records) == 1
