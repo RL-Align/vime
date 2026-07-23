@@ -8,7 +8,7 @@ import re
 import time
 from argparse import Namespace
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import torch
@@ -88,6 +88,8 @@ class LinearLogpRuntimeMetadata:
     contract_id: str | None = None
     fallback: bool = False
     fallback_reason: str | None = None
+    fallback_reason_code: str | None = None
+    strict_failure: bool = False
     memory_probe_enabled: bool = False
     memory_alloc_delta_mb: float | None = None
     memory_peak_alloc_delta_mb: float | None = None
@@ -96,6 +98,13 @@ class LinearLogpRuntimeMetadata:
 
 
 _LINEAR_LOGP_RUNTIME_METADATA = LinearLogpRuntimeMetadata()
+
+
+@dataclass(frozen=True)
+class _LinearLogpUnavailable:
+    code: str
+    message: str
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -148,6 +157,14 @@ def _fallback_code(reason: str) -> str:
     return code[:80] or "linear_logp_fallback"
 
 
+def _unavailable(code: str, message: str, **details: Any) -> _LinearLogpUnavailable:
+    return _LinearLogpUnavailable(
+        code=code,
+        message=message,
+        details={k: v for k, v in details.items() if v is not None},
+    )
+
+
 def _requested_modes(args: Namespace) -> tuple[str, str]:
     config = getattr(args, "rlk_mode_config", None)
     if config is not None:
@@ -179,13 +196,23 @@ def _emit_linear_logp_decision(
     actual_backend: str | None,
     fallback: bool,
     fallback_reason: str | None = None,
+    fallback_reason_code: str | None = None,
+    fallback_reason_details: dict[str, Any] | None = None,
     backend_id: str | None = None,
     contract_id: str | None = None,
     dtype: str | None = None,
     details: dict[str, Any] | None = None,
 ) -> None:
     fast, consistency = _requested_modes(args)
-    reason = None if fallback_reason is None else FallbackReason(code=_fallback_code(fallback_reason), message=fallback_reason)
+    reason = (
+        None
+        if fallback_reason is None
+        else FallbackReason(
+            code=fallback_reason_code or _fallback_code(fallback_reason),
+            message=fallback_reason,
+            details=fallback_reason_details or {},
+        )
+    )
     record = ExecutionDecision(
         operator="linear_logp",
         stage="train_logprob",
@@ -220,23 +247,54 @@ def _clear_linear_logp_memory_metadata() -> None:
     _LINEAR_LOGP_RUNTIME_METADATA.memory_peak_reserved_delta_mb = None
 
 
-def _set_linear_logp_fallback(args: Namespace, reason: str) -> None:
+def _set_linear_logp_unavailable(args: Namespace, reason: _LinearLogpUnavailable) -> None:
     _clear_linear_logp_memory_metadata()
     _LINEAR_LOGP_RUNTIME_METADATA.requested_backend = _requested_linear_logp_backend()
+    _LINEAR_LOGP_RUNTIME_METADATA.backend_id = None
+    _LINEAR_LOGP_RUNTIME_METADATA.fallback_reason = reason.message
+    _LINEAR_LOGP_RUNTIME_METADATA.fallback_reason_code = reason.code
+    if is_rl_kernel_strict(args):
+        _LINEAR_LOGP_RUNTIME_METADATA.actual_backend = None
+        _LINEAR_LOGP_RUNTIME_METADATA.contract_id = None
+        _LINEAR_LOGP_RUNTIME_METADATA.fallback = False
+        _LINEAR_LOGP_RUNTIME_METADATA.strict_failure = True
+        _emit_linear_logp_decision(
+            args,
+            decision="strict-failure",
+            actual_backend=None,
+            fallback=False,
+            fallback_reason=reason.message,
+            fallback_reason_code=reason.code,
+            fallback_reason_details=reason.details,
+            details=reason.details,
+        )
+        raise RuntimeError(f"RL-Kernel linear_logp strict mode rejected this configuration: {reason.message}")
+
+    _FALLBACK_COUNTS["linear_logp"] = _FALLBACK_COUNTS.get("linear_logp", 0) + 1
+    _RUNTIME_COUNTERS["linear_logp_fallback_count"] += 1.0
     _LINEAR_LOGP_RUNTIME_METADATA.actual_backend = _NATIVE_LINEAR_LOGP_BACKEND
     _LINEAR_LOGP_RUNTIME_METADATA.backend_id = _NATIVE_LINEAR_LOGP_BACKEND
     _LINEAR_LOGP_RUNTIME_METADATA.contract_id = "vime.native.linear_logp.selected_logprob"
     _LINEAR_LOGP_RUNTIME_METADATA.fallback = True
-    _LINEAR_LOGP_RUNTIME_METADATA.fallback_reason = reason
+    _LINEAR_LOGP_RUNTIME_METADATA.strict_failure = False
     _emit_linear_logp_decision(
         args,
         decision="fallback-native",
         actual_backend=_NATIVE_LINEAR_LOGP_BACKEND,
         fallback=True,
-        fallback_reason=reason,
+        fallback_reason=reason.message,
+        fallback_reason_code=reason.code,
+        fallback_reason_details=reason.details,
         backend_id=_NATIVE_LINEAR_LOGP_BACKEND,
         contract_id=_LINEAR_LOGP_RUNTIME_METADATA.contract_id,
+        details=reason.details,
     )
+    if reason.message not in _WARNED_FALLBACK_REASONS:
+        logger.warning(
+            "Falling back to vime logprob path because RL-Kernel linear_logp is unavailable: %s",
+            reason.message,
+        )
+        _WARNED_FALLBACK_REASONS.add(reason.message)
 
 
 def _set_linear_logp_selected_backend(args: Namespace, result: Any, dtype: torch.dtype) -> None:
@@ -251,6 +309,8 @@ def _set_linear_logp_selected_backend(args: Namespace, result: Any, dtype: torch
     _LINEAR_LOGP_RUNTIME_METADATA.contract_id = contract_id
     _LINEAR_LOGP_RUNTIME_METADATA.fallback = False
     _LINEAR_LOGP_RUNTIME_METADATA.fallback_reason = None
+    _LINEAR_LOGP_RUNTIME_METADATA.fallback_reason_code = None
+    _LINEAR_LOGP_RUNTIME_METADATA.strict_failure = False
     _emit_linear_logp_decision(
         args,
         decision="optimized",
@@ -271,6 +331,8 @@ def _set_linear_logp_zero_token_decision(args: Namespace) -> None:
     _LINEAR_LOGP_RUNTIME_METADATA.contract_id = None
     _LINEAR_LOGP_RUNTIME_METADATA.fallback = False
     _LINEAR_LOGP_RUNTIME_METADATA.fallback_reason = None
+    _LINEAR_LOGP_RUNTIME_METADATA.fallback_reason_code = None
+    _LINEAR_LOGP_RUNTIME_METADATA.strict_failure = False
     _emit_linear_logp_decision(
         args,
         decision="optimized",
@@ -318,6 +380,7 @@ def get_linear_logp_runtime_metadata() -> dict[str, Any]:
     metadata["backend_descriptor_id"] = _stable_descriptor_id(metadata.get("backend_id"))
     metadata["contract_descriptor_id"] = _stable_descriptor_id(metadata.get("contract_id"))
     metadata["fallback_reason_descriptor_id"] = _stable_descriptor_id(metadata.get("fallback_reason"))
+    metadata["fallback_reason_code_descriptor_id"] = _stable_descriptor_id(metadata.get("fallback_reason_code"))
     return metadata
 
 
@@ -328,6 +391,8 @@ def get_linear_logp_runtime_log_metrics(prefix: str = "train/rl_kernel_linear_lo
         f"{prefix}backend_descriptor_id": float(metadata["backend_descriptor_id"]),
         f"{prefix}contract_descriptor_id": float(metadata["contract_descriptor_id"]),
         f"{prefix}fallback_reason_descriptor_id": float(metadata["fallback_reason_descriptor_id"]),
+        f"{prefix}fallback_reason_code_descriptor_id": float(metadata["fallback_reason_code_descriptor_id"]),
+        f"{prefix}strict_failure": 1.0 if metadata.get("strict_failure") else 0.0,
     }
     for key in (
         "memory_alloc_delta_mb",
@@ -404,14 +469,11 @@ def _maybe_cast_hidden_for_bf16_fast_path(hidden_states: torch.Tensor, weight: t
 
 
 def _warn_fallback(args: Namespace, reason: str) -> None:
-    _FALLBACK_COUNTS["linear_logp"] = _FALLBACK_COUNTS.get("linear_logp", 0) + 1
-    _RUNTIME_COUNTERS["linear_logp_fallback_count"] += 1.0
-    _set_linear_logp_fallback(args, reason)
-    if is_rl_kernel_strict(args):
-        raise RuntimeError(f"RL-Kernel linear_logp is enabled but unavailable: {reason}")
-    if reason not in _WARNED_FALLBACK_REASONS:
-        logger.warning("Falling back to vime logprob path because RL-Kernel linear_logp is unavailable: %s", reason)
-        _WARNED_FALLBACK_REASONS.add(reason)
+    _set_linear_logp_unavailable(args, _unavailable(_fallback_code(reason), reason))
+
+
+def _handle_linear_logp_unavailable(args: Namespace, reason: _LinearLogpUnavailable) -> None:
+    _set_linear_logp_unavailable(args, reason)
 
 
 def _get_linear_logp_adapter(args: Namespace):
@@ -524,15 +586,306 @@ def get_linear_logp_context_from_model(args: Namespace, model) -> LinearLogpCont
     )
 
 
-def _linear_logp_runtime_blocker(args: Namespace, *, with_entropy: bool) -> str | None:
+def _linear_logp_runtime_blocker(args: Namespace, *, with_entropy: bool) -> _LinearLogpUnavailable | None:
     if with_entropy:
-        return "entropy is requested"
-    if getattr(args, "qkv_format", "thd") != "thd":
-        return "only qkv_format=thd is supported by RL-Kernel linear_logp"
+        return _unavailable("entropy_requested", "entropy is requested")
+    qkv_format = getattr(args, "qkv_format", "thd")
+    if qkv_format != "thd":
+        return _unavailable(
+            "unsupported_qkv_format",
+            "only qkv_format=thd is supported by RL-Kernel linear_logp",
+            qkv_format=qkv_format,
+        )
     if mpu.get_context_parallel_world_size() != 1 or getattr(args, "allgather_cp", False):
-        return "context parallel logprob redistribution is not supported by RL-Kernel linear_logp"
-    if getattr(args, "rollout_temperature", 1.0) <= 0:
-        return "rollout_temperature must be positive"
+        return _unavailable(
+            "unsupported_context_parallel",
+            "context parallel logprob redistribution is not supported by RL-Kernel linear_logp",
+            cp_world_size=int(mpu.get_context_parallel_world_size()),
+            allgather_cp=bool(getattr(args, "allgather_cp", False)),
+        )
+    rollout_temperature = float(getattr(args, "rollout_temperature", 1.0))
+    if rollout_temperature <= 0:
+        return _unavailable(
+            "invalid_temperature",
+            "rollout_temperature must be positive",
+            rollout_temperature=rollout_temperature,
+        )
+    if rollout_temperature != 1.0:
+        return _unavailable(
+            "unsupported_temperature",
+            "RL-Kernel linear_logp currently requires rollout_temperature=1.0",
+            rollout_temperature=rollout_temperature,
+        )
+    return None
+
+
+def _active_mask_blocker(
+    args: Namespace,
+    *,
+    loss_masks: list[torch.Tensor] | tuple[torch.Tensor, ...] | None,
+    response_lengths: list[int] | tuple[int, ...] | None,
+) -> _LinearLogpUnavailable | None:
+    if not is_rl_kernel_strict(args):
+        return None
+    if loss_masks is None or response_lengths is None:
+        return _unavailable(
+            "active_mask_missing",
+            "active response loss masks are required for RL-Kernel linear_logp strict mode",
+        )
+    if len(loss_masks) != len(response_lengths):
+        return _unavailable(
+            "active_mask_count_mismatch",
+            "active response loss mask count does not match response length count",
+            loss_mask_count=len(loss_masks),
+            response_length_count=len(response_lengths),
+        )
+
+    active_tokens = 0
+    for idx, (loss_mask, response_length) in enumerate(zip(loss_masks, response_lengths, strict=True)):
+        if not isinstance(loss_mask, torch.Tensor):
+            return _unavailable(
+                "active_mask_not_tensor",
+                "active response loss mask must be a tensor",
+                sample_index=idx,
+                loss_mask_type=type(loss_mask).__name__,
+            )
+        if loss_mask.dim() != 1:
+            return _unavailable(
+                "active_mask_rank_invalid",
+                "active response loss mask must be a 1-D tensor",
+                sample_index=idx,
+                loss_mask_shape=tuple(loss_mask.shape),
+            )
+        if loss_mask.numel() != int(response_length):
+            return _unavailable(
+                "active_mask_length_mismatch",
+                "active response loss mask length does not match response length",
+                sample_index=idx,
+                loss_mask_length=int(loss_mask.numel()),
+                response_length=int(response_length),
+            )
+        detached = loss_mask.detach()
+        if torch.is_floating_point(detached) and not torch.isfinite(detached).all().item():
+            return _unavailable(
+                "active_mask_non_finite",
+                "active response loss mask contains non-finite values",
+                sample_index=idx,
+            )
+        if not torch.logical_or(detached == 0, detached == 1).all().item():
+            return _unavailable(
+                "active_mask_not_binary",
+                "active response loss mask must contain only 0/1 values",
+                sample_index=idx,
+            )
+        active_tokens += int(detached.sum().item())
+
+    if active_tokens == 0:
+        logger.warning("RL-Kernel linear_logp strict mode saw zero active response tokens in this batch.")
+    return None
+
+
+def _linear_logp_input_blocker(
+    args: Namespace,
+    *,
+    hidden_states: torch.Tensor,
+    target_ids: torch.Tensor,
+    context: LinearLogpContext,
+    loss_masks: list[torch.Tensor] | tuple[torch.Tensor, ...] | None,
+    response_lengths: list[int] | tuple[int, ...] | None,
+) -> _LinearLogpUnavailable | None:
+    mask_blocker = _active_mask_blocker(args, loss_masks=loss_masks, response_lengths=response_lengths)
+    if mask_blocker is not None:
+        return mask_blocker
+
+    weight = context.lm_head_weight
+    bias = context.bias
+    if hidden_states.dim() != 2:
+        return _unavailable(
+            "hidden_rank_invalid",
+            "RL-Kernel linear_logp expects flattened hidden states with rank 2",
+            hidden_shape=tuple(hidden_states.shape),
+        )
+    if weight.dim() != 2:
+        return _unavailable(
+            "lm_head_weight_rank_invalid",
+            "RL-Kernel linear_logp expects an LM-head weight matrix with rank 2",
+            weight_shape=tuple(weight.shape),
+        )
+    if hidden_states.size(-1) != weight.size(-1):
+        return _unavailable(
+            "hidden_weight_shape_mismatch",
+            "hidden size does not match LM-head input size for RL-Kernel linear_logp",
+            hidden_shape=tuple(hidden_states.shape),
+            weight_shape=tuple(weight.shape),
+        )
+    if not hidden_states.is_floating_point() or not weight.is_floating_point():
+        return _unavailable(
+            "non_floating_inputs",
+            "RL-Kernel linear_logp requires floating-point hidden states and LM-head weights",
+            hidden_dtype=str(hidden_states.dtype).replace("torch.", ""),
+            weight_dtype=str(weight.dtype).replace("torch.", ""),
+        )
+    if hidden_states.device != weight.device:
+        return _unavailable(
+            "device_mismatch",
+            "hidden states and LM-head weights must live on the same device for RL-Kernel linear_logp",
+            hidden_device=str(hidden_states.device),
+            weight_device=str(weight.device),
+        )
+    if target_ids.device != hidden_states.device:
+        return _unavailable(
+            "target_device_mismatch",
+            "target IDs and hidden states must live on the same device for RL-Kernel linear_logp",
+            hidden_device=str(hidden_states.device),
+            target_device=str(target_ids.device),
+        )
+    if target_ids.numel() != hidden_states.size(0):
+        return _unavailable(
+            "target_count_mismatch",
+            "target ID count must match flattened hidden-state row count",
+            hidden_rows=int(hidden_states.size(0)),
+            target_count=int(target_ids.numel()),
+        )
+    if target_ids.dtype not in {torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}:
+        return _unavailable(
+            "target_dtype_invalid",
+            "target IDs must use an integer dtype for RL-Kernel linear_logp",
+            target_dtype=str(target_ids.dtype).replace("torch.", ""),
+        )
+    if bias is not None:
+        if bias.dim() != 1 or bias.numel() != weight.size(0):
+            return _unavailable(
+                "bias_shape_mismatch",
+                "LM-head bias shape must match local vocabulary size for RL-Kernel linear_logp",
+                bias_shape=tuple(bias.shape),
+                local_vocab_size=int(weight.size(0)),
+            )
+        if not bias.is_floating_point():
+            return _unavailable(
+                "bias_dtype_invalid",
+                "LM-head bias must be floating point for RL-Kernel linear_logp",
+                bias_dtype=str(bias.dtype).replace("torch.", ""),
+            )
+        if bias.device != weight.device:
+            return _unavailable(
+                "bias_device_mismatch",
+                "LM-head bias and weight must live on the same device for RL-Kernel linear_logp",
+                bias_device=str(bias.device),
+                weight_device=str(weight.device),
+            )
+
+    supported_dtypes = {torch.float16, torch.bfloat16, torch.float32}
+    if hidden_states.dtype not in supported_dtypes or weight.dtype not in supported_dtypes:
+        return _unavailable(
+            "unsupported_dtype",
+            "RL-Kernel linear_logp supports fp16, bf16, or fp32 hidden states and weights",
+            hidden_dtype=str(hidden_states.dtype).replace("torch.", ""),
+            weight_dtype=str(weight.dtype).replace("torch.", ""),
+        )
+    if is_rl_kernel_strict(args):
+        if hidden_states.dtype != weight.dtype:
+            return _unavailable(
+                "dtype_contract_mismatch",
+                "RL-Kernel linear_logp strict mode requires hidden states and LM-head weights to share a dtype",
+                hidden_dtype=str(hidden_states.dtype).replace("torch.", ""),
+                weight_dtype=str(weight.dtype).replace("torch.", ""),
+            )
+        if bias is not None and bias.dtype != weight.dtype:
+            return _unavailable(
+                "bias_dtype_contract_mismatch",
+                "RL-Kernel linear_logp strict mode requires LM-head bias and weights to share a dtype",
+                bias_dtype=str(bias.dtype).replace("torch.", ""),
+                weight_dtype=str(weight.dtype).replace("torch.", ""),
+            )
+        if _linear_logp_needs_bf16_fast_path_cast() and hidden_states.dtype != torch.bfloat16:
+            return _unavailable(
+                "implicit_downcast_not_strict",
+                "RL-Kernel linear_logp strict mode does not allow implicit hidden-state downcast",
+                hidden_dtype=str(hidden_states.dtype).replace("torch.", ""),
+                requested_downcast="bfloat16",
+            )
+
+    tp_world_size = int(mpu.get_tensor_model_parallel_world_size())
+    local_vocab_size = int(weight.size(0))
+    global_vocab_size = context.global_vocab_size
+    if tp_world_size > 1:
+        if context.tp_group is None:
+            return _unavailable(
+                "tp_group_missing",
+                "tensor-parallel group metadata is required for RL-Kernel linear_logp",
+                tp_world_size=tp_world_size,
+            )
+        if global_vocab_size is None:
+            return _unavailable(
+                "global_vocab_size_missing",
+                "global vocabulary size metadata is required for tensor-parallel RL-Kernel linear_logp",
+                tp_world_size=tp_world_size,
+            )
+        if context.vocab_start_index < 0:
+            return _unavailable(
+                "vocab_start_index_invalid",
+                "tensor-parallel vocab_start_index must be non-negative",
+                vocab_start_index=context.vocab_start_index,
+            )
+        if global_vocab_size < context.vocab_start_index + local_vocab_size:
+            return _unavailable(
+                "global_vocab_size_invalid",
+                "global vocabulary size does not cover the local tensor-parallel shard",
+                global_vocab_size=global_vocab_size,
+                vocab_start_index=context.vocab_start_index,
+                local_vocab_size=local_vocab_size,
+            )
+    elif global_vocab_size is not None and global_vocab_size < local_vocab_size:
+        return _unavailable(
+            "global_vocab_size_invalid",
+            "global vocabulary size must be at least the local vocabulary size",
+            global_vocab_size=global_vocab_size,
+            local_vocab_size=local_vocab_size,
+        )
+
+    target_for_bounds = target_ids.detach()
+    if target_for_bounds.numel() > 0:
+        if target_for_bounds.min().item() < 0:
+            return _unavailable("target_id_out_of_range", "target IDs must be non-negative")
+        max_token_id = int(target_for_bounds.max().item())
+        upper_bound = global_vocab_size if global_vocab_size is not None else local_vocab_size
+        if max_token_id >= upper_bound:
+            return _unavailable(
+                "target_id_out_of_range",
+                "target ID exceeds the declared vocabulary size for RL-Kernel linear_logp",
+                max_token_id=max_token_id,
+                vocab_upper_bound=upper_bound,
+            )
+
+    return None
+
+
+def _linear_logp_result_blocker(
+    *,
+    result_value: torch.Tensor,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> _LinearLogpUnavailable | None:
+    if not torch.is_tensor(result_value):
+        return _unavailable(
+            "result_not_tensor",
+            "RL-Kernel linear_logp returned a non-tensor result",
+            result_type=type(result_value).__name__,
+        )
+    if result_value.numel() != hidden_states.size(0):
+        return _unavailable(
+            "result_count_mismatch",
+            "RL-Kernel linear_logp result count does not match hidden-state row count",
+            result_count=int(result_value.numel()),
+            hidden_rows=int(hidden_states.size(0)),
+        )
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (hidden_states, weight, bias) if isinstance(tensor, torch.Tensor)):
+        if not result_value.requires_grad:
+            return _unavailable(
+                "backward_saved_state_missing",
+                "RL-Kernel linear_logp did not return an autograd-connected result for train-time strict/full-gradient use",
+            )
     return None
 
 
@@ -541,7 +894,7 @@ def should_use_linear_logp_model_output(args: Namespace, *, with_entropy: bool) 
         return False
     reason = _linear_logp_runtime_blocker(args, with_entropy=with_entropy)
     if reason is not None:
-        _warn_fallback(args, reason)
+        _handle_linear_logp_unavailable(args, reason)
         return False
     return True
 
@@ -578,17 +931,34 @@ def maybe_compute_linear_logp(
     context: LinearLogpContext | None,
     args: Namespace,
     with_entropy: bool,
+    loss_masks: list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
+    response_lengths: list[int] | tuple[int, ...] | None = None,
 ) -> torch.Tensor | None:
     if not is_rl_kernel_op_enabled(args, "linear_logp"):
         return None
 
     reason = _linear_logp_runtime_blocker(args, with_entropy=with_entropy)
     if reason is not None:
-        _warn_fallback(args, reason)
+        _handle_linear_logp_unavailable(args, reason)
         return None
 
     if context is None:
-        _warn_fallback(args, "hidden-state linear_logp context is unavailable")
+        _handle_linear_logp_unavailable(
+            args,
+            _unavailable("context_missing", "hidden-state linear_logp context is unavailable"),
+        )
+        return None
+
+    reason = _linear_logp_input_blocker(
+        args,
+        hidden_states=hidden_states,
+        target_ids=target_ids,
+        context=context,
+        loss_masks=loss_masks,
+        response_lengths=response_lengths,
+    )
+    if reason is not None:
+        _handle_linear_logp_unavailable(args, reason)
         return None
 
     if target_ids.numel() == 0:
@@ -632,15 +1002,39 @@ def maybe_compute_linear_logp(
                 metadata={"requested_backend": _requested_linear_logp_backend()},
             )
         )
-    except RlkOperatorUnavailable:
-        raise
+    except RlkOperatorUnavailable as exc:
+        _handle_linear_logp_unavailable(
+            args,
+            _unavailable("operator_unavailable", str(exc)),
+        )
+        return None
     except Exception as exc:
-        _warn_fallback(args, str(exc))
+        _handle_linear_logp_unavailable(
+            args,
+            _unavailable("operator_execution_failed", str(exc)),
+        )
         return None
 
     elapsed_s = getattr(result.decision, "elapsed_s", 0.0) or (time.perf_counter() - start_s)
     if result.value is None:
-        _warn_fallback(args, result.decision.reason or "adapter returned no linear_logp value")
+        _handle_linear_logp_unavailable(
+            args,
+            _unavailable(
+                "operator_returned_no_value",
+                result.decision.reason or "adapter returned no linear_logp value",
+                adapter_path=getattr(result.decision, "path", None),
+            ),
+        )
+        return None
+
+    reason = _linear_logp_result_blocker(
+        result_value=result.value,
+        hidden_states=hidden_states,
+        weight=weight,
+        bias=bias,
+    )
+    if reason is not None:
+        _handle_linear_logp_unavailable(args, reason)
         return None
 
     _set_linear_logp_selected_backend(args, result, hidden_states.dtype)

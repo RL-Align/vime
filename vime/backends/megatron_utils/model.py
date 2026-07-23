@@ -28,6 +28,7 @@ try:
     from megatron.core.pipeline_parallel.utils import unwrap_model
 except ImportError:
     from megatron.core.utils import unwrap_model
+
 from vime.utils import logging_utils
 from vime.utils.memory_utils import clear_memory
 from vime.utils.rl_kernel import is_rl_kernel_op_enabled
@@ -39,8 +40,8 @@ from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_log_probs_and_entropy, get_rollo
 from .model_provider import get_model_provider_func
 from .rl_kernel import (
     get_linear_logp_context_from_model,
-    get_linear_logp_runtime_metadata,
     get_linear_logp_runtime_log_metrics,
+    get_linear_logp_runtime_metadata,
     get_rl_kernel_runtime_counter_delta,
     get_rl_kernel_runtime_counters,
     return_hidden_states_for_linear_logp,
@@ -482,6 +483,7 @@ def forward_only(
             "unconcat_tokens": unconcat_tokens,
             "total_lengths": total_lengths,
             "response_lengths": response_lengths,
+            "loss_masks": batch["loss_masks"],
             "with_entropy": args.use_rollout_entropy,
         }
         if use_rollout_top_p_replay:

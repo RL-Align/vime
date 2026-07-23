@@ -59,6 +59,8 @@ train/rl_kernel_linear_logp_fallback
 train/rl_kernel_linear_logp_backend_descriptor_id
 train/rl_kernel_linear_logp_contract_descriptor_id
 train/rl_kernel_linear_logp_fallback_reason_descriptor_id
+train/rl_kernel_linear_logp_fallback_reason_code_descriptor_id
+train/rl_kernel_linear_logp_strict_failure
 train/rl_kernel_linear_logp_call_count_total
 train/rl_kernel_linear_logp_call_count_delta
 train/rl_kernel_linear_logp_token_count_total
@@ -101,11 +103,21 @@ scheduling.
 Native fallback is preserved. Unsupported cases record `fallback=1` and a
 structured fallback reason, then materialize logits and compute selected
 logprobs through the native vime/Megatron path unless strict mode is enabled.
+Under `--rlk-fast strict`, the same unsupported cases emit a `strict-failure`
+execution decision and raise instead of marking a native fallback.
 
 Common fallback reasons include:
 
 - the optional RL-Kernel package is unavailable;
+- `rollout_temperature` is not `1.0`;
+- strict mode is missing active response loss masks, or the masks are not
+  binary and response-length aligned;
 - entropy was requested;
 - CP redistribution is active;
+- tensor-parallel metadata such as `tp_group`, `vocab_start_index`, or
+  `global_vocab_size` is incomplete;
+- dtype/downcast metadata does not satisfy the strict contract;
 - the selected op does not accept tensor-parallel metadata;
+- the selected op does not return an autograd-connected tensor for train-time
+  full-gradient use;
 - the model output layer or LM-head weight is unavailable.

@@ -67,6 +67,18 @@ class _FakeLegacyLinearLogpOp:
         return torch.gather(torch.log_softmax(logits, dim=-1), -1, target_ids.long().unsqueeze(-1)).squeeze(-1)
 
 
+class _FakeDetachedLinearLogpOp(_FakeLinearLogpOp):
+    def __call__(
+        self,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        target_ids: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        return super().__call__(hidden, weight, target_ids, bias, **kwargs).detach()
+
+
 def _drop_rl_engine_modules() -> None:
     for name in list(sys.modules):
         if name == "rl_engine" or name.startswith("rl_engine."):
@@ -252,6 +264,178 @@ def test_linear_logp_full_gradient_path_matches_materialized_logits(monkeypatch)
     torch.testing.assert_close(actual_grads[0], hidden_ref.grad, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(actual_grads[1], weight_ref.grad, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(actual_grads[2], bias_ref.grad, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.unit
+def test_linear_logp_strict_fast_success_records_no_fallback(monkeypatch):
+    _install_fake_rl_engine(monkeypatch)
+    args = _make_args(rlk_fast="strict")
+    torch.manual_seed(12)
+    hidden = torch.randn(4, 3, requires_grad=True)
+    weight = torch.randn(6, 3, requires_grad=True)
+    target = torch.randint(0, 6, (4,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None)
+
+    actual = rlk_mod.maybe_compute_linear_logp(
+        hidden,
+        target,
+        context=context,
+        args=args,
+        with_entropy=False,
+        loss_masks=[torch.tensor([1, 1]), torch.tensor([1, 0])],
+        response_lengths=[2, 2],
+    )
+
+    torch.testing.assert_close(actual, _reference_logp(hidden, weight, target, None))
+    assert rlk_mod.get_rl_kernel_fallback_count("linear_logp") == 0
+    counters = rlk_mod.get_rl_kernel_runtime_counters()
+    assert counters["linear_logp_call_count"] == 1.0
+    assert counters["linear_logp_fallback_count"] == 0.0
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["actual_backend"] == "_FakeLinearLogpOp"
+    assert metadata["fallback"] is False
+    assert metadata["fallback_reason"] is None
+    assert metadata["fallback_reason_code"] is None
+    assert metadata["strict_failure"] is False
+    assert rlk_mod.get_linear_logp_runtime_log_metrics(prefix="x/")["x/strict_failure"] == 0.0
+
+
+@pytest.mark.unit
+def test_linear_logp_auto_fallback_has_structured_temperature_reason(monkeypatch):
+    _install_fake_rl_engine(monkeypatch)
+    args = _make_args(rollout_temperature=0.7)
+    hidden = torch.randn(3, 4)
+    weight = torch.randn(6, 4)
+    target = torch.randint(0, 6, (3,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None)
+
+    actual = rlk_mod.maybe_compute_linear_logp(hidden, target, context=context, args=args, with_entropy=False)
+
+    assert actual is None
+    assert _FakeLinearLogpOp.calls == []
+    assert rlk_mod.get_rl_kernel_fallback_count("linear_logp") == 1
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["actual_backend"] == "vime.native.linear_logp"
+    assert metadata["fallback"] is True
+    assert metadata["fallback_reason_code"] == "unsupported_temperature"
+    assert metadata["strict_failure"] is False
+
+
+@pytest.mark.unit
+def test_linear_logp_strict_fails_when_temperature_would_fallback(monkeypatch):
+    _install_fake_rl_engine(monkeypatch)
+    args = _make_args(rlk_fast="strict", rollout_temperature=0.7)
+    hidden = torch.randn(3, 4)
+    weight = torch.randn(6, 4)
+    target = torch.randint(0, 6, (3,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None)
+
+    with pytest.raises(RuntimeError, match="rollout_temperature=1.0"):
+        rlk_mod.maybe_compute_linear_logp(hidden, target, context=context, args=args, with_entropy=False)
+
+    assert _FakeLinearLogpOp.calls == []
+    assert rlk_mod.get_rl_kernel_fallback_count("linear_logp") == 0
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["actual_backend"] is None
+    assert metadata["fallback"] is False
+    assert metadata["fallback_reason_code"] == "unsupported_temperature"
+    assert metadata["strict_failure"] is True
+
+
+@pytest.mark.unit
+def test_linear_logp_strict_requires_active_mask_metadata(monkeypatch):
+    _install_fake_rl_engine(monkeypatch)
+    args = _make_args(rlk_fast="strict")
+    hidden = torch.randn(2, 4)
+    weight = torch.randn(5, 4)
+    target = torch.randint(0, 5, (2,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None)
+
+    with pytest.raises(RuntimeError, match="active response loss masks"):
+        rlk_mod.maybe_compute_linear_logp(hidden, target, context=context, args=args, with_entropy=False)
+
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["fallback_reason_code"] == "active_mask_missing"
+    assert metadata["strict_failure"] is True
+
+
+@pytest.mark.unit
+def test_linear_logp_strict_rejects_invalid_active_mask(monkeypatch):
+    _install_fake_rl_engine(monkeypatch)
+    args = _make_args(rlk_fast="strict")
+    hidden = torch.randn(2, 4)
+    weight = torch.randn(5, 4)
+    target = torch.randint(0, 5, (2,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None)
+
+    with pytest.raises(RuntimeError, match="0/1"):
+        rlk_mod.maybe_compute_linear_logp(
+            hidden,
+            target,
+            context=context,
+            args=args,
+            with_entropy=False,
+            loss_masks=[torch.tensor([1, 2])],
+            response_lengths=[2],
+        )
+
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["fallback_reason_code"] == "active_mask_not_binary"
+    assert metadata["strict_failure"] is True
+
+
+@pytest.mark.unit
+def test_linear_logp_strict_requires_tensor_parallel_metadata(monkeypatch):
+    _install_fake_rl_engine(monkeypatch)
+    mpu.get_tensor_model_parallel_world_size.return_value = 2
+    mpu.get_tensor_model_parallel_group.return_value = None
+    args = _make_args(rlk_fast="strict")
+    hidden = torch.randn(2, 4)
+    weight = torch.randn(5, 4)
+    target = torch.randint(0, 10, (2,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None, global_vocab_size=10)
+
+    with pytest.raises(RuntimeError, match="tensor-parallel group metadata"):
+        rlk_mod.maybe_compute_linear_logp(
+            hidden,
+            target,
+            context=context,
+            args=args,
+            with_entropy=False,
+            loss_masks=[torch.tensor([1, 1])],
+            response_lengths=[2],
+        )
+
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["fallback_reason_code"] == "tp_group_missing"
+    assert metadata["strict_failure"] is True
+
+
+@pytest.mark.unit
+def test_linear_logp_strict_rejects_missing_backward_saved_state(monkeypatch):
+    _install_fake_rl_engine(monkeypatch, op_factory=lambda: _FakeDetachedLinearLogpOp())
+    args = _make_args(rlk_fast="strict")
+    hidden = torch.randn(2, 4, requires_grad=True)
+    weight = torch.randn(5, 4, requires_grad=True)
+    target = torch.randint(0, 5, (2,))
+    context = rlk_mod.LinearLogpContext(lm_head_weight=weight, bias=None, tp_group=None)
+
+    with pytest.raises(RuntimeError, match="autograd-connected"):
+        rlk_mod.maybe_compute_linear_logp(
+            hidden,
+            target,
+            context=context,
+            args=args,
+            with_entropy=False,
+            loss_masks=[torch.tensor([1, 1])],
+            response_lengths=[2],
+        )
+
+    assert len(_FakeLinearLogpOp.calls) == 1
+    metadata = rlk_mod.get_linear_logp_runtime_metadata()
+    assert metadata["fallback_reason_code"] == "backward_saved_state_missing"
+    assert metadata["fallback"] is False
+    assert metadata["strict_failure"] is True
 
 
 @pytest.mark.unit

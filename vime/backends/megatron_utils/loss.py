@@ -543,6 +543,7 @@ def get_log_probs_and_entropy(
     unconcat_tokens: list[torch.Tensor],
     total_lengths: list[int],
     response_lengths: list[int],
+    loss_masks: list[torch.Tensor] | None = None,
     with_entropy: bool = False,
     non_loss_data: bool = True,
     top_p_token_ids: list[list[int]] | None = None,
@@ -593,6 +594,8 @@ def get_log_probs_and_entropy(
             context=linear_logp_context,
             args=args,
             with_entropy=with_entropy,
+            loss_masks=loss_masks,
+            response_lengths=response_lengths,
         )
 
     if log_prob_full is None and linear_logp_context is not None:
@@ -1014,6 +1017,7 @@ def policy_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
+        loss_masks=batch["loss_masks"],
         with_entropy=need_entropy,
         rl_kernel_linear_logp_context=rl_kernel_linear_logp_context,
         **get_rollout_top_p_logprob_kwargs(args, batch),
@@ -1319,6 +1323,7 @@ def sft_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
+        loss_masks=batch.get("loss_masks"),
         with_entropy=False,
         rl_kernel_linear_logp_context=rl_kernel_linear_logp_context,
     )
