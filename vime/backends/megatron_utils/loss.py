@@ -10,6 +10,7 @@ from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
 from vime.utils.distributed_utils import distributed_masked_whiten
+from vime.utils.dlogp_diagnostics import compute_dlogp_diagnostics, is_dlogp_audit_enabled
 from vime.utils.misc import load_function
 from vime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
@@ -36,6 +37,12 @@ ROLLOUT_TOP_P_TOKEN_KEYS = (
     "rollout_top_p_token_ids",
     "rollout_top_p_token_offsets",
 )
+
+
+def _get_dist_rank_or_none() -> int | None:
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+    return dist.get_rank()
 
 
 def get_rollout_top_p_logprob_kwargs(args: Namespace, batch: dict[str, Any]) -> dict[str, Any]:
@@ -932,6 +939,7 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    audit_train_log_probs = log_probs
     if not args.use_rollout_logprobs and not old_log_probs:
         old_log_probs = [log_prob.detach() for log_prob in log_probs]
     train_log_probs_for_tis = batch.get("log_probs")
@@ -1083,6 +1091,24 @@ def policy_loss_function(
         log_probs_to_compare = log_probs if args.use_rollout_logprobs else old_log_probs
         train_rollout_logprob_abs_diff = sum_of_sample_mean((log_probs_to_compare - rollout_log_probs).abs())
 
+    dlogp_audit_metrics = {}
+    if is_dlogp_audit_enabled(args):
+        dlogp_audit_metrics = compute_dlogp_diagnostics(
+            audit_train_log_probs,
+            batch.get("rollout_log_probs"),
+            batch["loss_masks"],
+            sample_indices=batch.get("sample_indices"),
+            rollout_ids=batch.get("rollout_ids"),
+            metadata=batch.get("metadata"),
+            rank=_get_dist_rank_or_none(),
+            model_name=getattr(args, "model_name", None),
+            backend_id=getattr(args, "train_backend", "megatron"),
+            contract_id=getattr(args, "rlk_contract_id", None),
+            batch_layout_fingerprint=getattr(args, "rlk_batch_layout_fingerprint", None),
+            provenance_fingerprint=getattr(args, "rlk_provenance_fingerprint", None),
+            eps_clip=getattr(args, "eps_clip", 0.2),
+        ).metrics
+
     reported_loss = {
         "loss": loss.clone().detach(),
         "pg_loss": pg_loss.clone().detach(),
@@ -1093,6 +1119,7 @@ def policy_loss_function(
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
+    reported_loss.update(dlogp_audit_metrics)
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
