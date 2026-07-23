@@ -58,7 +58,6 @@ def launch_server_process(server_args_dict: dict) -> multiprocessing.Process:
 def _build_subprocess_env(server_args_dict: dict[str, Any]) -> dict[str, str]:
     args = server_args_dict["_args"]
     env = os.environ.copy()
-    env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
     env.setdefault("NCCL_CUMEM_ENABLE", "0")
     env["CUDA_VISIBLE_DEVICES"] = server_args_dict["_visible_devices"]
     # ROCm: keep HIP visibility in sync with CUDA (no-op on CUDA).

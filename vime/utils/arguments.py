@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import yaml
@@ -15,6 +16,16 @@ from vime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs
 from vime.utils.logging_utils import configure_logger
 
 logger = logging.getLogger(__name__)
+
+RLK_FAST_CHOICES = ("off", "auto", "strict")
+RLK_CONSISTENCY_CHOICES = ("off", "audit", "strict")
+
+
+@dataclass(frozen=True)
+class RlkModeConfig:
+    fast: str
+    consistency: str
+    ops: tuple[str, ...]
 
 
 def reset_arg(parser, name, **kwargs):
@@ -31,6 +42,115 @@ def reset_arg(parser, name, **kwargs):
             break
     else:
         parser.add_argument(name, **kwargs)
+
+
+def _parse_rl_kernel_ops(value):
+    if value is None:
+        return ()
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, list):
+        return tuple(value)
+    return tuple(op.strip() for op in value.split(",") if op.strip())
+
+
+def _get_env_choice(name, choices):
+    raw_value = os.environ.get(name)
+    if raw_value is None or raw_value == "":
+        return None
+
+    value = raw_value.strip().lower()
+    if value not in choices:
+        allowed = ", ".join(choices)
+        raise ValueError(f"{name} must be one of {{{allowed}}}, got {raw_value!r}.")
+    return value
+
+
+def _validate_rlk_choice(name, value, choices):
+    if value not in choices:
+        allowed = ", ".join(choices)
+        raise ValueError(f"--{name.replace('_', '-')} must be one of {{{allowed}}}, got {value!r}.")
+    return value
+
+
+def resolve_rlk_mode_config(args):
+    """Resolve RL-Kernel public controls into one config object."""
+    env_fast = (
+        None if getattr(args, "rlk_fast", None) is not None else _get_env_choice("VIME_RLK_FAST", RLK_FAST_CHOICES)
+    )
+    env_consistency = (
+        None
+        if getattr(args, "rlk_consistency", None) is not None
+        else _get_env_choice("VIME_RLK_CONSISTENCY", RLK_CONSISTENCY_CHOICES)
+    )
+
+    legacy_fast = None
+    if getattr(args, "rl_kernel_strict", False):
+        legacy_fast = "strict"
+    elif getattr(args, "enable_rl_kernel", False):
+        legacy_fast = "auto"
+
+    fast = _validate_rlk_choice(
+        "rlk_fast", getattr(args, "rlk_fast", None) or env_fast or legacy_fast or "off", RLK_FAST_CHOICES
+    )
+    consistency = _validate_rlk_choice(
+        "rlk_consistency",
+        getattr(args, "rlk_consistency", None) or env_consistency or "off",
+        RLK_CONSISTENCY_CHOICES,
+    )
+    ops = _parse_rl_kernel_ops(getattr(args, "rl_kernel_ops", ()))
+
+    config = RlkModeConfig(fast=fast, consistency=consistency, ops=ops)
+    # Compatibility aliases for existing callers; new code should prefer the
+    # immutable args.rlk_mode_config so resolved mode state has one owner.
+    args.rlk_fast = fast
+    args.rlk_consistency = consistency
+    args.rl_kernel_ops = ops
+    args.rlk_mode_config = config
+    return config
+
+
+def add_rl_kernel_arguments(parser):
+    parser.add_argument(
+        "--rlk-fast",
+        choices=RLK_FAST_CHOICES,
+        default=None,
+        help=(
+            "Select RL-Kernel fast-path behavior independently from consistency auditing: "
+            "'off' keeps native vime execution, 'auto' uses eligible RL-Kernel backends with fallback, "
+            "and 'strict' requires enabled RL-Kernel backends. Defaults to VIME_RLK_FAST or off; "
+            "--enable-rl-kernel maps to auto and --rl-kernel-strict maps to strict when not explicitly set."
+        ),
+    )
+    parser.add_argument(
+        "--rlk-consistency",
+        choices=RLK_CONSISTENCY_CHOICES,
+        default=None,
+        help=(
+            "Select rollout-training consistency diagnostics independently from fast-path acceleration: "
+            "'off' disables diagnostics, 'audit' reports diagnostics without changing execution, "
+            "and 'strict' requires contract checks. Defaults to VIME_RLK_CONSISTENCY or off."
+        ),
+    )
+    parser.add_argument(
+        "--enable-rl-kernel",
+        action="store_true",
+        default=False,
+        help="Compatibility alias: selects --rlk-fast auto unless --rlk-fast or VIME_RLK_FAST is set.",
+    )
+    parser.add_argument(
+        "--rl-kernel-strict",
+        action="store_true",
+        default=False,
+        help="Compatibility alias: selects --rlk-fast strict unless --rlk-fast or VIME_RLK_FAST is set.",
+    )
+    parser.add_argument(
+        "--rl-kernel-ops",
+        type=_parse_rl_kernel_ops,
+        default=(),
+        help="Comma-separated RL-Kernel operator allowlist, for example linear_logp,logp.",
+    )
+    return parser
 
 
 def get_vime_extra_args_provider(add_custom_arguments=None):
@@ -1516,6 +1636,9 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
 
         parser = add_cluster_arguments(parser)
         parser = add_train_arguments(parser)
+        # Production parser path: RL-Kernel controls are framework-level vime
+        # flags, not CI-only switches.
+        parser = add_rl_kernel_arguments(parser)
         parser = add_rollout_arguments(parser)
         parser = add_fault_tolerance_arguments(parser)
         parser = add_data_arguments(parser)
@@ -1747,6 +1870,7 @@ def _validate_update_weight_args(args) -> None:
 
 
 def vime_validate_args(args):
+    resolve_rlk_mode_config(args)
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.kl_coef != 0 or args.use_kl_loss:
@@ -2009,6 +2133,7 @@ def vime_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+        resolve_rlk_mode_config(args)
 
     if args.eval_max_context_len is None:
         logger.info(
