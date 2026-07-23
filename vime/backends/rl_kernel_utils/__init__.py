@@ -1,4 +1,4 @@
-"""RL-Kernel adapter boundary owned by vime."""
+"""RL-Kernel adapter and execution utilities owned by vime."""
 
 from vime.backends.rl_kernel_utils.adapter import (
     RLK_ALL_OPERATORS,
@@ -25,8 +25,34 @@ from vime.backends.rl_kernel_utils.adapter import (
     rlk_policy_context_from_args,
     runtime_batch_metadata_from_vime_batch,
 )
+from vime.backends.rl_kernel_utils.execution import (
+    BackendCapability,
+    CapabilityQueryResult,
+    ExecutionDecision,
+    FallbackReason,
+    LogprobContractMetadata,
+    NumericContract,
+    RlKernelCapabilities,
+    build_logprob_contract_decision,
+    emit_execution_decision,
+    execution_decision_sample_value,
+    query_rl_kernel_capabilities,
+    select_execution_decision,
+)
 
 __all__ = [
+    "BackendCapability",
+    "CapabilityQueryResult",
+    "ExecutionDecision",
+    "FallbackReason",
+    "LogprobContractMetadata",
+    "NumericContract",
+    "RlKernelCapabilities",
+    "build_logprob_contract_decision",
+    "emit_execution_decision",
+    "execution_decision_sample_value",
+    "query_rl_kernel_capabilities",
+    "select_execution_decision",
     "LinearLogpInputs",
     "MockRlkOperatorAdapter",
     "NoOpRlkOperatorAdapter",
