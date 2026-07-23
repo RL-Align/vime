@@ -67,6 +67,7 @@ Start by Use Case
    advanced/vllm-config.md
    advanced/megatron-config.md
    advanced/rl-kernel-operator-adapter.md
+   advanced/rl-kernel-linear-logp.md
    advanced/arch-support-beyond-megatron.md
 
 .. toctree::

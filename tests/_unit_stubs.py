@@ -202,14 +202,18 @@ def install_megatron_mpu_stub() -> MagicMock:
     transformer_mod.__path__ = []
     transformer_layer_mod = types.ModuleType("megatron.core.transformer.transformer_layer")
     transformer_layer_mod.get_transformer_layer_offset = lambda *args, **kwargs: 0
+    tensor_parallel_mod = types.ModuleType("megatron.core.tensor_parallel")
+    tensor_parallel_mod.gather_from_sequence_parallel_region = lambda value, tensor_parallel_output_grad=False: value
     transformer_mod.transformer_layer = transformer_layer_mod
     megatron_core.parallel_state = parallel_state_mod
     megatron_core.transformer = transformer_mod
+    megatron_core.tensor_parallel = tensor_parallel_mod
     megatron_mod = types.ModuleType("megatron")
     megatron_mod.core = megatron_core
     sys.modules.setdefault("megatron", megatron_mod)
     sys.modules.setdefault("megatron.core", megatron_core)
     sys.modules.setdefault("megatron.core.parallel_state", parallel_state_mod)
+    sys.modules.setdefault("megatron.core.tensor_parallel", tensor_parallel_mod)
     sys.modules.setdefault("megatron.core.transformer", transformer_mod)
     sys.modules.setdefault("megatron.core.transformer.transformer_layer", transformer_layer_mod)
     return mpu_stub
@@ -328,5 +332,6 @@ def install_triton_stub() -> None:
 
 def install_vime_distributed_utils_stub() -> None:
     vime_utils = types.ModuleType("vime.utils.distributed_utils")
+    vime_utils.distributed_masked_whiten = lambda values, masks, process_group=None, shift_mean=True: values
     vime_utils.get_gloo_group = MagicMock(return_value="gloo")
     sys.modules.setdefault("vime.utils.distributed_utils", vime_utils)

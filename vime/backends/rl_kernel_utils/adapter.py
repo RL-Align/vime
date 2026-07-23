@@ -471,15 +471,31 @@ class RlkRegistryOperatorAdapter:
             return self._unsupported_result_or_raise(op_name, capability, token_count=token_count)
         op = self._get_op(op_name)
         start = time.perf_counter()
-        value = fn(op)
+        try:
+            value = fn(op)
+        except Exception as exc:
+            capability = RlkCapability(
+                op_name=op_name,
+                available=False,
+                backend=type(op).__name__,
+                reason=f"RL-Kernel op {op_name!r} failed during execution: {exc}",
+            )
+            return self._unsupported_result_or_raise(op_name, capability, token_count=token_count)
         elapsed_s = time.perf_counter() - start
+        backend_id = _op_text_attr(op, "backend_id", "backend_name", "name")
+        contract_id = _op_text_attr(op, "contract_id", "numeric_contract_id")
+        provenance = dict(self.provenance())
+        if backend_id is not None:
+            provenance["backend_id"] = backend_id
+        if contract_id is not None:
+            provenance["contract_id"] = contract_id
         decision = RlkOperatorDecision(
             op_name=op_name,
             path="fast",
             backend=type(op).__name__,
             elapsed_s=elapsed_s,
             token_count=token_count,
-            provenance=self.provenance(),
+            provenance=provenance,
         )
         self.telemetry.record_decision(decision)
         return RlkOperatorResult(value=value, decision=decision)
@@ -676,6 +692,21 @@ def _policy_payload(policy: RlkPolicyContext) -> dict[str, Any]:
 
 def _registry_op_name(op_name: str) -> str:
     return RLK_OP_SELECTED_LOGPROBS if op_name == RLK_OP_REFERENCE_LOGPROBS else op_name
+
+
+def _op_text_attr(op: Any, *names: str) -> str | None:
+    for name in names:
+        value = getattr(op, name, None)
+        if value is None:
+            continue
+        if callable(value):
+            try:
+                value = value()
+            except TypeError:
+                continue
+        if value is not None:
+            return str(value)
+    return None
 
 
 def _mask_inactive_values(value: Any, mask: Any | None) -> Any:

@@ -24,6 +24,7 @@ from vime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
+from vime.utils.rl_kernel import is_rl_kernel_op_enabled
 from vime.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -31,6 +32,12 @@ from .cp_utils import (
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
+)
+from .rl_kernel import (
+    LinearLogpContext,
+    get_rl_kernel_fallback_count,
+    maybe_compute_linear_logp,
+    warn_linear_logp_fallback,
 )
 
 ROLLOUT_TOP_P_TOKEN_KEYS = (
@@ -481,6 +488,54 @@ def _extract_per_sample(
     return log_probs_list, entropy_list
 
 
+def _gather_sequence_parallel_hidden_if_needed(
+    hidden_states: torch.Tensor,
+    context: LinearLogpContext | None,
+) -> torch.Tensor:
+    if context is None or not context.sequence_parallel:
+        return hidden_states
+
+    from megatron.core import tensor_parallel
+
+    return tensor_parallel.gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
+
+
+def _flatten_logprob_model_output(
+    output_tensor: torch.Tensor,
+    *,
+    linear_logp_context: LinearLogpContext | None,
+) -> torch.Tensor:
+    assert len(output_tensor.shape) == 3, f"{output_tensor.shape}"
+    if output_tensor.size(0) == 1:
+        return output_tensor.squeeze(0)
+    if linear_logp_context is not None and output_tensor.size(1) == 1:
+        return output_tensor.squeeze(1)
+    assert output_tensor.size(0) == 1, f"{output_tensor.shape}"
+    return output_tensor.squeeze(0)
+
+
+def _materialize_linear_logits(
+    hidden_states: torch.Tensor,
+    *,
+    context: LinearLogpContext,
+    args: Namespace,
+) -> torch.Tensor:
+    logits = F.linear(hidden_states, context.lm_head_weight, context.bias)
+    rollout_temperature = getattr(args, "rollout_temperature", 1.0)
+    if rollout_temperature != 1.0:
+        logits = logits / rollout_temperature
+    return logits.float()
+
+
+def _policy_loss_needs_entropy(
+    args: Namespace,
+    rl_kernel_linear_logp_context: LinearLogpContext | None,
+) -> bool:
+    if rl_kernel_linear_logp_context is None:
+        return True
+    return getattr(args, "entropy_coef", 0.0) != 0
+
+
 def get_log_probs_and_entropy(
     logits: torch.Tensor,
     *,
@@ -492,6 +547,7 @@ def get_log_probs_and_entropy(
     non_loss_data: bool = True,
     top_p_token_ids: list[list[int]] | None = None,
     top_p_token_offsets: list[list[int]] | None = None,
+    rl_kernel_linear_logp_context: LinearLogpContext | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
@@ -503,16 +559,19 @@ def get_log_probs_and_entropy(
     log-probabilities; entropy is always computed from the unmasked logits.
     """
     assert non_loss_data
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
-    assert len(logits.shape) == 3, f"{logits.shape}"
-    assert logits.size(0) == 1, f"{logits.shape}"
-    logits = logits.squeeze(0)
+    linear_logp_context = rl_kernel_linear_logp_context
+    if linear_logp_context is not None:
+        logits = _gather_sequence_parallel_hidden_if_needed(logits, linear_logp_context)
+    else:
+        assert logits.dtype == torch.float32, f"{logits.dtype}"
 
-    # Apply rollout temperature scaling to logits to match rollout-time log-probs.
-    rollout_temperature = getattr(args, "rollout_temperature", 1.0)
-    if rollout_temperature != 1.0:
-        logits = logits / rollout_temperature
-    logits = logits.contiguous()
+    logits = _flatten_logprob_model_output(logits, linear_logp_context=linear_logp_context).contiguous()
+    if linear_logp_context is None:
+        # Apply rollout temperature scaling to logits to match rollout-time log-probs.
+        rollout_temperature = getattr(args, "rollout_temperature", 1.0)
+        if rollout_temperature != 1.0:
+            logits = logits / rollout_temperature
+        logits = logits.contiguous()
     T = logits.size(0)
     device = logits.device
     tp_group = mpu.get_tensor_model_parallel_group()
@@ -523,6 +582,22 @@ def get_log_probs_and_entropy(
 
     # --- build full shifted-token target tensor ---
     full_tokens = _build_shifted_tokens(T, device, unconcat_tokens, total_lengths, response_lengths, args.allgather_cp)
+
+    log_prob_full = None
+    if linear_logp_context is not None and (top_p_token_ids is not None or top_p_token_offsets is not None):
+        warn_linear_logp_fallback(args, "rollout top-p replay requires materialized logits")
+    elif linear_logp_context is not None:
+        log_prob_full = maybe_compute_linear_logp(
+            logits,
+            full_tokens,
+            context=linear_logp_context,
+            args=args,
+            with_entropy=with_entropy,
+        )
+
+    if log_prob_full is None and linear_logp_context is not None:
+        logits = _materialize_linear_logits(logits, context=linear_logp_context, args=args).contiguous()
+        linear_logp_context = None
 
     # --- build top-p nucleus keep-mask (logprob only; entropy stays unmasked) ---
     top_p_keep_mask = None
@@ -539,15 +614,18 @@ def get_log_probs_and_entropy(
         )
 
     # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
-    log_prob_full, entropy_full = calculate_log_probs_and_entropy(
-        logits,
-        full_tokens,
-        tp_group,
-        with_entropy=with_entropy,
-        with_entropy_grad=with_entropy_grad,
-        chunk_size=chunk_size,
-        log_prob_keep_mask=top_p_keep_mask,
-    )
+    if log_prob_full is None:
+        log_prob_full, entropy_full = calculate_log_probs_and_entropy(
+            logits,
+            full_tokens,
+            tp_group,
+            with_entropy=with_entropy,
+            with_entropy_grad=with_entropy_grad,
+            chunk_size=chunk_size,
+            log_prob_keep_mask=top_p_keep_mask,
+        )
+    else:
+        entropy_full = None
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
     # --- extract per-sample response portions ---
@@ -897,6 +975,7 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    rl_kernel_linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO) and metrics.
 
@@ -927,6 +1006,7 @@ def policy_loss_function(
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
+    need_entropy = _policy_loss_needs_entropy(args, rl_kernel_linear_logp_context)
 
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -934,7 +1014,8 @@ def policy_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        with_entropy=True,
+        with_entropy=need_entropy,
+        rl_kernel_linear_logp_context=rl_kernel_linear_logp_context,
         **get_rollout_top_p_logprob_kwargs(args, batch),
     )
 
@@ -1059,9 +1140,12 @@ def policy_loss_function(
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
     # entropy loss
-    entropy = log_probs_and_entropy["entropy"]
-    entropy = torch.cat(entropy, dim=0)
-    entropy_loss = sum_of_sample_mean(entropy)
+    if need_entropy:
+        entropy = log_probs_and_entropy["entropy"]
+        entropy = torch.cat(entropy, dim=0)
+        entropy_loss = sum_of_sample_mean(entropy)
+    else:
+        entropy_loss = log_probs.new_zeros(())
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 
@@ -1149,6 +1233,7 @@ def value_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    rl_kernel_linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute clipped value loss and metrics.
 
@@ -1167,6 +1252,7 @@ def value_loss_function(
         Tuple of `(loss, metrics)` where `loss` is a scalar tensor and
         `metrics` contains detached scalars "value_loss" and "value_clipfrac".
     """
+    del rl_kernel_linear_logp_context
     old_values = torch.cat(batch["values"], dim=0)
 
     _, values = get_values(
@@ -1206,6 +1292,7 @@ def sft_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    rl_kernel_linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute supervised fine-tuning loss over response tokens.
 
@@ -1233,6 +1320,7 @@ def sft_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=False,
+        rl_kernel_linear_logp_context=rl_kernel_linear_logp_context,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1257,6 +1345,7 @@ def loss_function(
     num_microbatches: int,
     step_global_batch_size: int,
     logits: torch.Tensor,
+    rl_kernel_linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -1307,10 +1396,22 @@ def loss_function(
         case _:
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
-    if args.recompute_loss_function:
-        loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean, use_reentrant=False)
+    if func in {policy_loss_function, value_loss_function, sft_loss_function}:
+        func_args = (args, batch, logits, sum_of_sample_mean, rl_kernel_linear_logp_context)
     else:
-        loss, log = func(args, batch, logits, sum_of_sample_mean)
+        func_args = (args, batch, logits, sum_of_sample_mean)
+
+    if args.recompute_loss_function:
+        loss, log = checkpoint(func, *func_args, use_reentrant=False)
+    else:
+        loss, log = func(*func_args)
+
+    if is_rl_kernel_op_enabled(args, "linear_logp"):
+        log["rl_kernel_fallback_count"] = torch.tensor(
+            get_rl_kernel_fallback_count(),
+            device=logits.device,
+            dtype=torch.float32,
+        )
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding). Without this, gradient doesn't flow through their attention path, so

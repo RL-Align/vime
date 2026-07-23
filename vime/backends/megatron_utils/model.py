@@ -30,12 +30,23 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from vime.utils import logging_utils
 from vime.utils.memory_utils import clear_memory
+from vime.utils.rl_kernel import is_rl_kernel_op_enabled
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
-from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
+from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_log_probs_and_entropy, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
+from .rl_kernel import (
+    get_linear_logp_context_from_model,
+    get_linear_logp_runtime_metadata,
+    get_linear_logp_runtime_log_metrics,
+    get_rl_kernel_runtime_counter_delta,
+    get_rl_kernel_runtime_counters,
+    return_hidden_states_for_linear_logp,
+    should_use_linear_logp_model_output,
+    warn_linear_logp_fallback,
+)
 from .stateless_adam import StatelessAdam
 
 logger = logging.getLogger(__name__)
@@ -79,6 +90,35 @@ def _with_rollout_top_p_token_keys(args: Namespace, keys: Sequence[str]) -> list
     if args.rollout_top_p == 1.0:
         return list(keys)
     return [*keys, *ROLLOUT_TOP_P_TOKEN_KEYS]
+
+
+def _forward_only_should_return_hidden_for_linear_logp(
+    f: Callable[..., dict[str, list[torch.Tensor]]],
+    args: Namespace,
+) -> bool:
+    return f is get_log_probs_and_entropy and should_use_linear_logp_model_output(
+        args,
+        with_entropy=args.use_rollout_entropy,
+    )
+
+
+def _train_should_return_hidden_for_linear_logp(args: Namespace, *, return_schedule_plan: bool) -> bool:
+    if not is_rl_kernel_op_enabled(args, "linear_logp"):
+        return False
+
+    if args.loss_type not in {"policy_loss", "sft_loss"}:
+        return False
+
+    if return_schedule_plan:
+        warn_linear_logp_fallback(args, "schedule-plan forward path is not supported")
+        return False
+
+    if getattr(args, "enable_mtp_training", False):
+        warn_linear_logp_fallback(args, "MTP training path is not supported")
+        return False
+
+    with_entropy = args.loss_type == "policy_loss" and getattr(args, "entropy_coef", 0.0) != 0
+    return should_use_linear_logp_model_output(args, with_entropy=with_entropy)
 
 
 def _iter_critic_output_layers(model: Sequence[DDP]):
@@ -430,7 +470,12 @@ def forward_only(
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
-        output_tensor = model(**forward_kwargs)
+        linear_logp_context = None
+        if _forward_only_should_return_hidden_for_linear_logp(f, args):
+            linear_logp_context = get_linear_logp_context_from_model(args, model)
+
+        with return_hidden_states_for_linear_logp(args, model, linear_logp_context):
+            output_tensor = model(**forward_kwargs)
 
         output_kwargs = {
             "args": args,
@@ -441,6 +486,8 @@ def forward_only(
         }
         if use_rollout_top_p_replay:
             output_kwargs.update(get_rollout_top_p_logprob_kwargs(args, batch))
+        if f is get_log_probs_and_entropy:
+            output_kwargs["rl_kernel_linear_logp_context"] = linear_logp_context
 
         return output_tensor, partial(f, **output_kwargs)
 
@@ -603,6 +650,10 @@ def train_one_step(
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
+        linear_logp_context = None
+        if _train_should_return_hidden_for_linear_logp(args, return_schedule_plan=return_schedule_plan):
+            linear_logp_context = get_linear_logp_context_from_model(args, model)
+
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             position_ids = None
@@ -646,12 +697,20 @@ def train_one_step(
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
-            output_tensor = model(**forward_kwargs)
+            with return_hidden_states_for_linear_logp(args, model, linear_logp_context):
+                output_tensor = model(**forward_kwargs)
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
+        return output_tensor, partial(
+            loss_function,
+            args,
+            batch,
+            num_microbatches,
+            step_global_batch_size,
+            rl_kernel_linear_logp_context=linear_logp_context,
+        )
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
@@ -902,6 +961,35 @@ def train(
 
             # Per-step gbs — uneven step sizes are easy to miss without this.
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
+            if role == "actor" and is_rl_kernel_op_enabled(args, "linear_logp"):
+                runtime_totals = get_rl_kernel_runtime_counters()
+                runtime_delta = get_rl_kernel_runtime_counter_delta()
+                linear_logp_metadata = get_linear_logp_runtime_metadata()
+                for key, value in runtime_totals.items():
+                    log_dict[f"train/rl_kernel_{key}_total"] = value
+                for key, value in runtime_delta.items():
+                    log_dict[f"train/rl_kernel_{key}_delta"] = value
+                log_dict.update(get_linear_logp_runtime_log_metrics())
+
+                total_calls = runtime_totals.get("linear_logp_call_count", 0.0)
+                delta_calls = runtime_delta.get("linear_logp_call_count", 0.0)
+                log_dict["train/rl_kernel_linear_logp_tokens_per_call_total"] = (
+                    runtime_totals.get("linear_logp_token_count", 0.0) / total_calls if total_calls > 0 else 0.0
+                )
+                log_dict["train/rl_kernel_linear_logp_tokens_per_call_delta"] = (
+                    runtime_delta.get("linear_logp_token_count", 0.0) / delta_calls if delta_calls > 0 else 0.0
+                )
+                logger.info(
+                    "RL-Kernel linear_logp runtime_metadata: requested_backend=%s actual_backend=%s "
+                    "backend_id=%s contract_id=%s fallback=%s fallback_reason=%s memory_probe_enabled=%s",
+                    linear_logp_metadata.get("requested_backend"),
+                    linear_logp_metadata.get("actual_backend"),
+                    linear_logp_metadata.get("backend_id"),
+                    linear_logp_metadata.get("contract_id"),
+                    linear_logp_metadata.get("fallback"),
+                    linear_logp_metadata.get("fallback_reason"),
+                    linear_logp_metadata.get("memory_probe_enabled"),
+                )
             log_dict["train/step"] = accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")
 
