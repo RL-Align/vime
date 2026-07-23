@@ -12,6 +12,20 @@ from vime.backends.rl_kernel_utils.execution import (
     query_rl_kernel_capabilities,
     select_execution_decision,
 )
+from vime.backends.rl_kernel_utils.operator_adapter import (
+    MockRlkOperatorAdapter,
+    NoopRlkOperatorAdapter,
+    RlKernelOperatorAdapter,
+    RlKernelRegistryBackend,
+    RlkLinearLogpRequest,
+    RlkOperatorAdapter,
+    RlkOperatorProvenance,
+    RlkOperatorResult,
+    RlkPolicyContext,
+    RlkReferenceScoreRequest,
+    RlkSelectedLogprobRequest,
+    build_rlk_operator_adapter,
+)
 
 __all__ = [
     "BackendCapability",
@@ -22,8 +36,20 @@ __all__ = [
     "NumericContract",
     "RlKernelCapabilities",
     "build_logprob_contract_decision",
+    "build_rlk_operator_adapter",
     "emit_execution_decision",
     "execution_decision_sample_value",
+    "MockRlkOperatorAdapter",
+    "NoopRlkOperatorAdapter",
     "query_rl_kernel_capabilities",
+    "RlKernelOperatorAdapter",
+    "RlKernelRegistryBackend",
+    "RlkLinearLogpRequest",
+    "RlkOperatorAdapter",
+    "RlkOperatorProvenance",
+    "RlkOperatorResult",
+    "RlkPolicyContext",
+    "RlkReferenceScoreRequest",
+    "RlkSelectedLogprobRequest",
     "select_execution_decision",
 ]

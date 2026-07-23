@@ -64,6 +64,7 @@ Start by Use Case
    advanced/pd-disaggregation.md
    advanced/external-rollout-engines.md
    advanced/delta-weight-sync.md
+   advanced/rl-kernel-operator-adapter.md
    advanced/vllm-config.md
    advanced/megatron-config.md
    advanced/arch-support-beyond-megatron.md
