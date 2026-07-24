@@ -23,6 +23,7 @@ GPU_MEMORY_TYPE_WEIGHTS = "weights"
 GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
 from vime.rollout.base_types import call_rollout_fn
 from vime.utils import logging_utils
+from vime.utils.consistency_audit import build_consistency_replay_manifest
 from vime.utils.consistency_metadata import (
     build_batch_layout_fingerprints,
     get_consistency_mode,
@@ -866,7 +867,8 @@ class RolloutManager:
             rollout_indices=data["rollout_ids"],
         )
 
-        if get_consistency_mode(self.args) != "off" or "consistency_metadata" in data:
+        consistency_mode = get_consistency_mode(self.args)
+        if consistency_mode != "off" or "consistency_metadata" in data:
             data["consistency_batch_layout_fingerprints"] = build_batch_layout_fingerprints(
                 data,
                 partitions=partitions,
@@ -915,6 +917,13 @@ class RolloutManager:
             rollout_data["global_batch_sizes"] = global_batch_sizes
             rollout_data["num_microbatches"] = num_microbatches
             rollout_data["micro_batch_indices"] = micro_batch_indices[r]
+            if consistency_mode != "off" or "consistency_metadata" in rollout_data:
+                rollout_data["consistency_replay_manifest"] = build_consistency_replay_manifest(
+                    rollout_data,
+                    mode=consistency_mode,
+                    rank=r,
+                    validation=data.get("consistency_metadata_validation"),
+                )
             _tensorize_rollout_data_for_training(rollout_data)
             transport = getattr(self.args, "rollout_data_transport", "object-store")
             if transport == "nixl":

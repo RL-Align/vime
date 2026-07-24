@@ -9,8 +9,9 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
+from vime.utils.consistency_audit import run_consistency_audit
 from vime.utils.distributed_utils import distributed_masked_whiten
-from vime.utils.dlogp_diagnostics import compute_dlogp_diagnostics, is_dlogp_audit_enabled
+from vime.utils.dlogp_diagnostics import is_dlogp_audit_enabled
 from vime.utils.misc import load_function
 from vime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
@@ -35,6 +36,7 @@ from .cp_utils import (
 )
 from .rl_kernel import (
     LinearLogpContext,
+    get_linear_logp_runtime_metadata,
     get_rl_kernel_fallback_count,
     maybe_compute_linear_logp,
     warn_linear_logp_fallback,
@@ -1181,19 +1183,23 @@ def policy_loss_function(
 
     dlogp_audit_metrics = {}
     if is_dlogp_audit_enabled(args):
-        dlogp_audit_metrics = compute_dlogp_diagnostics(
+        dlogp_audit_metrics = run_consistency_audit(
             audit_train_log_probs,
             batch.get("rollout_log_probs"),
             batch["loss_masks"],
+            args=args,
+            batch=batch,
             sample_indices=batch.get("sample_indices"),
             rollout_ids=batch.get("rollout_ids"),
-            metadata=batch.get("metadata"),
             rank=_get_dist_rank_or_none(),
             model_name=getattr(args, "model_name", None),
             backend_id=getattr(args, "train_backend", "megatron"),
             contract_id=getattr(args, "rlk_contract_id", None),
             batch_layout_fingerprint=getattr(args, "rlk_batch_layout_fingerprint", None),
             provenance_fingerprint=getattr(args, "rlk_provenance_fingerprint", None),
+            runtime_provenance=(
+                get_linear_logp_runtime_metadata() if rl_kernel_linear_logp_context is not None else None
+            ),
             eps_clip=getattr(args, "eps_clip", 0.2),
         ).metrics
 

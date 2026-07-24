@@ -15,6 +15,7 @@ if str(_tests_root) not in sys.path:
 
 import _unit_stubs
 
+from vime.utils.consistency_metadata import stable_fingerprint
 from vime.utils.dlogp_diagnostics import compute_dlogp_diagnostics, get_rlk_consistency_mode, is_dlogp_audit_enabled
 
 NUM_GPUS = 0
@@ -96,6 +97,31 @@ def _policy_batch() -> dict:
         "sample_indices": [42],
         "rollout_ids": [7],
     }
+
+
+def _complete_consistency_record() -> dict:
+    record = {
+        "schema_version": 1,
+        "sample": {"index": 42, "rollout_id": 7, "session_id": "session-42"},
+        "tokens": {"response_token_ids_fingerprint": stable_fingerprint([1, 2])},
+        "active_mask": {"mask_fingerprint": stable_fingerprint([1, 1]), "active_token_count": 2},
+        "tokenizer": {"fingerprint": "tokenizer"},
+        "sampling": {"params_fingerprint": "sampling"},
+        "padding": {"side": "right"},
+        "position_cache": {"fingerprint": "position-cache"},
+        "quantization": {"fingerprint": "quantization"},
+        "model": {"name": "record-model"},
+        "weight": {"version": "weights-v1", "pre_update": True},
+        "old_logp": {"source": "rollout_engine", "contract_id": "record-contract"},
+        "provenance": {
+            "actual": {"backend": "record-backend", "fallback": False},
+            "actual_fingerprint": "record-provenance",
+            "mismatches": {},
+            "undeclared_fallback": False,
+        },
+    }
+    record["fingerprint"] = stable_fingerprint(record)
+    return record
 
 
 @pytest.mark.unit
@@ -331,6 +357,87 @@ def test_policy_loss_adds_audit_metrics_only_when_enabled_without_changing_loss(
     assert audit_metrics["rlk_audit_dlogp_abs_mean"].item() == pytest.approx(0.2)
     assert audit_metrics["rlk_audit_worst_sample_index"].item() == pytest.approx(42.0)
     assert audit_metrics["rlk_audit_worst_rollout_id"].item() == pytest.approx(7.0)
+
+
+@pytest.mark.unit
+def test_policy_loss_uses_consistency_metadata_for_audit_context(monkeypatch, megatron_loss_module):
+    train_log_probs = [torch.tensor([0.1, 0.3])]
+
+    def fake_get_log_probs_and_entropy(*args, **kwargs):
+        return None, {"log_probs": train_log_probs, "entropy": [torch.zeros(2)]}
+
+    def fake_compute_policy_loss(ppo_kl, advantages, eps_clip, eps_clip_high):
+        del advantages, eps_clip, eps_clip_high
+        return torch.ones_like(ppo_kl), torch.zeros_like(ppo_kl)
+
+    monkeypatch.setattr(megatron_loss_module, "get_log_probs_and_entropy", fake_get_log_probs_and_entropy)
+    monkeypatch.setattr(megatron_loss_module, "compute_policy_loss", fake_compute_policy_loss)
+
+    def reducer(tensor):
+        return tensor.mean()
+
+    args = _policy_args("audit")
+    args.model_name = None
+    args.train_backend = None
+    args.rlk_contract_id = None
+    args.rlk_batch_layout_fingerprint = None
+    args.rlk_provenance_fingerprint = None
+    batch = _policy_batch()
+    batch["consistency_metadata"] = [_complete_consistency_record()]
+    batch["consistency_batch_layout_fingerprints"] = [{"fingerprint": "record-layout"}]
+
+    _, metrics = megatron_loss_module.policy_loss_function(
+        args,
+        batch,
+        torch.zeros(1, 2, 4),
+        reducer,
+    )
+
+    assert metrics["rlk_audit_warning_count"].item() == pytest.approx(0.0)
+    assert metrics["rlk_audit_metadata_warning_count"].item() == pytest.approx(0.0)
+    assert metrics["rlk_audit_replay_case_count"].item() == pytest.approx(5.0)
+    assert metrics["rlk_audit_worst_sample_index"].item() == pytest.approx(42.0)
+
+
+@pytest.mark.unit
+def test_policy_loss_adds_linear_logp_runtime_provenance(monkeypatch, megatron_loss_module):
+    train_log_probs = [torch.tensor([0.1, 0.3])]
+
+    def fake_get_log_probs_and_entropy(*args, **kwargs):
+        return None, {"log_probs": train_log_probs, "entropy": [torch.zeros(2)]}
+
+    def fake_compute_policy_loss(ppo_kl, advantages, eps_clip, eps_clip_high):
+        del advantages, eps_clip, eps_clip_high
+        return torch.ones_like(ppo_kl), torch.zeros_like(ppo_kl)
+
+    runtime_provenance = {
+        "operator": "linear_logp",
+        "requested_backend": "registry",
+        "actual_backend": "vime.native.linear_logp",
+        "fallback": True,
+        "fallback_reason": "unit fallback",
+    }
+
+    monkeypatch.setattr(megatron_loss_module, "get_log_probs_and_entropy", fake_get_log_probs_and_entropy)
+    monkeypatch.setattr(megatron_loss_module, "compute_policy_loss", fake_compute_policy_loss)
+    monkeypatch.setattr(megatron_loss_module, "get_linear_logp_runtime_metadata", lambda: runtime_provenance)
+
+    def reducer(tensor):
+        return tensor.mean()
+
+    batch = _policy_batch()
+    batch["consistency_metadata"] = [_complete_consistency_record()]
+    batch["consistency_batch_layout_fingerprints"] = [{"fingerprint": "record-layout"}]
+    _, metrics = megatron_loss_module.policy_loss_function(
+        _policy_args("audit"),
+        batch,
+        torch.zeros(1, 2, 4),
+        reducer,
+        rl_kernel_linear_logp_context=object(),
+    )
+
+    assert metrics["rlk_audit_runtime_fallback"].item() == pytest.approx(1.0)
+    assert metrics["rlk_audit_metadata_warning_count"].item() == pytest.approx(1.0)
 
 
 if __name__ == "__main__":

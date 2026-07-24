@@ -47,15 +47,31 @@ def ensure_ray_stub() -> None:
     if real_module_available("ray"):
         return
     ray = MagicMock()
+    ray.__path__ = []
+    ray.get = lambda refs: refs
+    ray.put = lambda value, **kwargs: value  # noqa: ARG005
+    ray.remote = _ray_remote_stub
+    ray.util = types.ModuleType("ray.util")
+    ray.util.__path__ = []
+    scheduling_strategies = types.ModuleType("ray.util.scheduling_strategies")
+    scheduling_strategies.PlacementGroupSchedulingStrategy = type(
+        "PlacementGroupSchedulingStrategy",
+        (),
+        {"__init__": lambda self, **kwargs: setattr(self, "kwargs", kwargs)},
+    )
+    ray.util.scheduling_strategies = scheduling_strategies
     sys.modules["ray"] = ray
     sys.modules["ray._private"] = MagicMock()
     sys.modules["ray._private.services"] = MagicMock()
     sys.modules["ray.actor"] = MagicMock()
+    sys.modules["ray.util"] = ray.util
+    sys.modules["ray.util.scheduling_strategies"] = scheduling_strategies
 
 
 def install_rollout_optional_stubs() -> None:
     """Stub rollout-side optional imports when not installed."""
     ensure_ray_stub()
+    install_pyarrow_stub()
 
     install_vllm_router_stub()
 
@@ -157,6 +173,24 @@ def install_wandb_stub() -> None:
     sys.modules["wandb"] = wandb_mod
 
 
+def install_pyarrow_stub() -> None:
+    if "pyarrow" in sys.modules:
+        return
+
+    pyarrow_mod = types.ModuleType("pyarrow")
+    pyarrow_mod.__path__ = []
+    parquet_mod = types.ModuleType("pyarrow.parquet")
+
+    class ParquetFile:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002
+            raise ImportError("pyarrow parquet support is unavailable in this unit-test environment")
+
+    parquet_mod.ParquetFile = ParquetFile
+    pyarrow_mod.parquet = parquet_mod
+    sys.modules["pyarrow"] = pyarrow_mod
+    sys.modules["pyarrow.parquet"] = parquet_mod
+
+
 def save_sys_modules(names: Iterable[str]) -> dict[str, Any]:
     return {k: sys.modules.get(k) for k in names}
 
@@ -221,13 +255,48 @@ def install_megatron_mpu_stub() -> MagicMock:
 
 def install_ray_stub() -> None:
     ray_mod = types.ModuleType("ray")
+    ray_mod.__path__ = []
     ray_mod.get = lambda refs: refs
+    ray_mod.put = lambda value, **kwargs: value  # noqa: ARG005
+    ray_mod.remote = _ray_remote_stub
     ray_mod.ObjectRef = object
     ray_mod.actor = types.ModuleType("ray.actor")
     ray_mod.actor.ActorHandle = object
     ray_mod._private = types.SimpleNamespace(services=types.SimpleNamespace(get_node_ip_address=lambda: "127.0.0.1"))
+    ray_mod.util = types.ModuleType("ray.util")
+    ray_mod.util.__path__ = []
+    scheduling_strategies = types.ModuleType("ray.util.scheduling_strategies")
+    scheduling_strategies.PlacementGroupSchedulingStrategy = type(
+        "PlacementGroupSchedulingStrategy",
+        (),
+        {"__init__": lambda self, **kwargs: setattr(self, "kwargs", kwargs)},
+    )
+    ray_mod.util.scheduling_strategies = scheduling_strategies
     sys.modules.setdefault("ray", ray_mod)
     sys.modules.setdefault("ray.actor", ray_mod.actor)
+    sys.modules.setdefault("ray.util", ray_mod.util)
+    sys.modules.setdefault("ray.util.scheduling_strategies", scheduling_strategies)
+
+
+class _RayRemoteWrapper:
+    def __init__(self, target):
+        self.__ray_actor_class__ = target
+        self._target = target
+
+    def options(self, **kwargs):  # noqa: ARG002
+        return self
+
+    def remote(self, *args, **kwargs):
+        return self._target(*args, **kwargs)
+
+
+def _ray_remote_stub(target=None, **kwargs):  # noqa: ARG001
+    def wrap(obj):
+        return _RayRemoteWrapper(obj) if isinstance(obj, type) else obj
+
+    if target is None:
+        return wrap
+    return wrap(target)
 
 
 def install_vllm_cli_stubs() -> None:

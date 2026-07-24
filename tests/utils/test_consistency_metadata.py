@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
 import pytest
 
-from vime.rollout.data_source import RolloutDataSourceWithBuffer
-from vime.utils.consistency_metadata import (
+_tests_root = Path(__file__).resolve().parents[1]
+if str(_tests_root) not in sys.path:
+    sys.path.insert(0, str(_tests_root))
+
+import _unit_stubs  # noqa: E402
+
+_unit_stubs.install_rollout_optional_stubs()
+
+from vime.rollout.data_source import RolloutDataSourceWithBuffer  # noqa: E402
+from vime.utils.consistency_metadata import (  # noqa: E402
     build_batch_layout_fingerprints,
     build_requested_actual_provenance,
     build_rollout_consistency_metadata,
@@ -15,7 +25,7 @@ from vime.utils.consistency_metadata import (
     stable_fingerprint,
     validate_samples_consistency_metadata,
 )
-from vime.utils.types import Sample
+from vime.utils.types import Sample  # noqa: E402
 
 NUM_GPUS = 0
 
