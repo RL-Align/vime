@@ -77,15 +77,19 @@ def _metadata(sample: Sample | None = None, *, args: Namespace | None = None, **
 
 def _batch(*, metadata=None, layout=None):
     metadata = [_metadata()] if metadata is None else metadata
-    layout = [
-        {
-            "fingerprint": "layout-1",
-            "active_mask_density": 1.0,
-            "dp_rank": 0,
-            "microbatch_id": 0,
-            "microbatch_offset": 0,
-        }
-    ] if layout is None else layout
+    layout = (
+        [
+            {
+                "fingerprint": "layout-1",
+                "active_mask_density": 1.0,
+                "dp_rank": 0,
+                "microbatch_id": 0,
+                "microbatch_offset": 0,
+            }
+        ]
+        if layout is None
+        else layout
+    )
     return {
         "tokens": [torch.tensor([101, 201, 202])],
         "unconcat_tokens": [torch.tensor([101, 201, 202])],

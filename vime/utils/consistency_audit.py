@@ -22,11 +22,7 @@ from vime.utils.consistency_metadata import (
     stable_fingerprint,
     validate_samples_consistency_metadata,
 )
-from vime.utils.dlogp_diagnostics import (
-    DlogpAuditReport,
-    compute_dlogp_diagnostics,
-    get_rlk_consistency_mode,
-)
+from vime.utils.dlogp_diagnostics import DlogpAuditReport, compute_dlogp_diagnostics, get_rlk_consistency_mode
 
 CONSISTENCY_AUDIT_SCHEMA_VERSION = 1
 AUDIT_REQUIRED_METADATA_FIELDS = (
@@ -289,8 +285,7 @@ def build_consistency_replay_manifest(
                 "total_length": _int_or_none(_sequence_value(_batch_get(batch, "total_lengths"), position)),
                 "response_length": response_length,
                 "active_token_count": _active_token_count(loss_mask, response_length),
-                "has_rollout_log_probs": _batch_sequence_value(batch, "rollout_log_probs", position)
-                is not None,
+                "has_rollout_log_probs": _batch_sequence_value(batch, "rollout_log_probs", position) is not None,
                 "consistency_metadata_fingerprint": None if record is None else record.get("fingerprint"),
                 "batch_layout_fingerprint": _first_present(
                     None if layout is None else layout.get("fingerprint"),
@@ -545,10 +540,7 @@ def _with_audit_required_metadata_issues(
 
     warnings = list(validation.warnings)
     failures = list(validation.failures)
-    seen = {
-        (issue.code, issue.sample_index, issue.rollout_id, issue.field)
-        for issue in (*warnings, *failures)
-    }
+    seen = {(issue.code, issue.sample_index, issue.rollout_id, issue.field) for issue in (*warnings, *failures)}
 
     for position, record in enumerate(records):
         if record is None:

@@ -1,5 +1,8 @@
 """RL-Kernel adapter and execution utilities owned by vime."""
 
+import importlib
+from typing import Any
+
 from vime.backends.rl_kernel_utils.adapter import (
     RLK_ALL_OPERATORS,
     RLK_OP_LINEAR_LOGP,
@@ -40,6 +43,67 @@ from vime.backends.rl_kernel_utils.execution import (
     select_execution_decision,
 )
 
+from vime.backends.rl_kernel_utils.operator_comparison import (
+    RlkOperatorComparisonUnavailable,
+    load_operator_comparison_module,
+)
+
+_OPERATOR_COMPARISON_EXPORTS = frozenset(
+    {
+        "OPERATOR_COMPARISON_SPECS",
+        "PHASE4_TARGET_OPERATORS",
+        "RLK_OP_ATTENTION",
+        "RLK_OP_DPO_FRAGMENT",
+        "RLK_OP_EMBEDDING",
+        "RLK_OP_GRPO_FRAGMENT",
+        "RLK_OP_LM_HEAD",
+        "RLK_OP_LOGP",
+        "RLK_OP_MATMUL_PROJECTION",
+        "RLK_OP_PPO_FRAGMENT",
+        "RLK_OP_RATIO_KL",
+        "RLK_OP_RMSNORM",
+        "RLK_OP_ROPE",
+        "RLK_OP_SWIGLU",
+        "BatchInvarianceCase",
+        "ForwardChainComparisonResult",
+        "ForwardChainStep",
+        "OperatorComparisonResult",
+        "OperatorComparisonSpec",
+        "OperatorPair",
+        "OperatorTolerance",
+        "StrictBackendAdmissionReport",
+        "build_single_card_batch_invariance_cases",
+        "build_strict_backend_admission_report",
+        "compare_batch_invariance",
+        "compare_operator_outputs",
+        "compare_operator_pair",
+        "get_operator_comparison_spec",
+        "iter_operator_comparison_specs",
+        "reference_attention",
+        "reference_embedding",
+        "reference_linear_logp",
+        "reference_lm_head",
+        "reference_matmul_projection",
+        "reference_ppo_fragment",
+        "reference_ratio_kl",
+        "reference_rmsnorm",
+        "reference_rope",
+        "reference_selected_logprobs",
+        "reference_swiglu",
+        "run_deterministic_repeatability_check",
+        "run_forward_chain_comparison",
+        "run_reference_operator",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _OPERATOR_COMPARISON_EXPORTS:
+        raise AttributeError(name)
+    module = importlib.import_module("vime.backends.rl_kernel_utils.operator_comparison")
+    return getattr(module, name)
+
+
 __all__ = [
     "BackendCapability",
     "CapabilityQueryResult",
@@ -76,4 +140,49 @@ __all__ = [
     "linear_logp_inputs_from_vime",
     "rlk_policy_context_from_args",
     "runtime_batch_metadata_from_vime_batch",
+    "RlkOperatorComparisonUnavailable",
+    "load_operator_comparison_module",
+    "BatchInvarianceCase",
+    "ForwardChainComparisonResult",
+    "ForwardChainStep",
+    "OPERATOR_COMPARISON_SPECS",
+    "OperatorComparisonResult",
+    "OperatorComparisonSpec",
+    "OperatorPair",
+    "OperatorTolerance",
+    "PHASE4_TARGET_OPERATORS",
+    "RLK_OP_ATTENTION",
+    "RLK_OP_DPO_FRAGMENT",
+    "RLK_OP_EMBEDDING",
+    "RLK_OP_GRPO_FRAGMENT",
+    "RLK_OP_LM_HEAD",
+    "RLK_OP_LOGP",
+    "RLK_OP_MATMUL_PROJECTION",
+    "RLK_OP_PPO_FRAGMENT",
+    "RLK_OP_RATIO_KL",
+    "RLK_OP_RMSNORM",
+    "RLK_OP_ROPE",
+    "RLK_OP_SWIGLU",
+    "StrictBackendAdmissionReport",
+    "build_single_card_batch_invariance_cases",
+    "build_strict_backend_admission_report",
+    "compare_batch_invariance",
+    "compare_operator_outputs",
+    "compare_operator_pair",
+    "get_operator_comparison_spec",
+    "iter_operator_comparison_specs",
+    "reference_attention",
+    "reference_embedding",
+    "reference_linear_logp",
+    "reference_lm_head",
+    "reference_matmul_projection",
+    "reference_ppo_fragment",
+    "reference_ratio_kl",
+    "reference_rmsnorm",
+    "reference_rope",
+    "reference_selected_logprobs",
+    "reference_swiglu",
+    "run_deterministic_repeatability_check",
+    "run_forward_chain_comparison",
+    "run_reference_operator",
 ]
