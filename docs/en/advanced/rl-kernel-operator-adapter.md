@@ -22,3 +22,14 @@ The current Phase 1 hooks are:
 - `provenance()`.
 
 Future `linear_logp` integration work should extend this adapter package rather than adding direct `rl_engine` imports to Megatron, rollout, or training modules.
+
+## Alignment Standard Boundary
+
+The A0-A5 alignment profile matrix is owned by RL-Kernel. vime imports it through
+`rl_engine.alignment.cross_config.get_alignment_standard()` and normalizes the
+returned object in `vime.backends.rl_kernel_utils.standard`.
+
+Keep vime-side changes minimal by putting RL-Kernel imports in this adapter
+boundary only. Training, rollout, and operator code should pass vime-owned
+records into the adapter and let RL-Kernel own the profile definitions,
+score-artifact schema, comparator, and tolerance fingerprints.

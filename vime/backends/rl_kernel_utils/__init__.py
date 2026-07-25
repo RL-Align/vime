@@ -47,6 +47,15 @@ from vime.backends.rl_kernel_utils.operator_comparison import (
     RlkOperatorComparisonUnavailable,
     load_operator_comparison_module,
 )
+from vime.backends.rl_kernel_utils.standard import (
+    RlkAlignmentStandardUnavailable,
+    alignment_standard_metadata,
+    build_standard_score_artifact,
+    compare_standard_score_records,
+    iter_alignment_profiles,
+    load_alignment_standard,
+    select_least_restrictive_passing_profile,
+)
 
 _OPERATOR_COMPARISON_EXPORTS = frozenset(
     {
@@ -142,6 +151,7 @@ __all__ = [
     "runtime_batch_metadata_from_vime_batch",
     "RlkOperatorComparisonUnavailable",
     "load_operator_comparison_module",
+    "iter_alignment_profiles",
     "BatchInvarianceCase",
     "ForwardChainComparisonResult",
     "ForwardChainStep",
@@ -185,4 +195,10 @@ __all__ = [
     "run_deterministic_repeatability_check",
     "run_forward_chain_comparison",
     "run_reference_operator",
+    "RlkAlignmentStandardUnavailable",
+    "alignment_standard_metadata",
+    "build_standard_score_artifact",
+    "compare_standard_score_records",
+    "load_alignment_standard",
+    "select_least_restrictive_passing_profile",
 ]
