@@ -1,10 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
 import pytest
 
-from vime.rollout.data_source import RolloutDataSourceWithBuffer
+_tests_root = Path(__file__).resolve().parents[1]
+if str(_tests_root) not in sys.path:
+    sys.path.insert(0, str(_tests_root))
+
+import _unit_stubs
+
+_unit_stubs.install_rollout_optional_stubs()
+_unit_stubs.install_vllm_cli_stubs()
+
+from vime.rollout.data_source import RolloutDataSourceWithBuffer  # noqa: E402
 from vime.utils.consistency_metadata import (
     build_batch_layout_fingerprints,
     build_requested_actual_provenance,
@@ -14,10 +25,16 @@ from vime.utils.consistency_metadata import (
     raise_for_consistency_metadata_failures,
     stable_fingerprint,
     validate_samples_consistency_metadata,
-)
-from vime.utils.types import Sample
+)  # noqa: E402
+from vime.utils.types import Sample  # noqa: E402
 
 NUM_GPUS = 0
+
+
+def _drop_rl_engine_modules() -> None:
+    for name in list(sys.modules):
+        if name == "rl_engine" or name.startswith("rl_engine."):
+            sys.modules.pop(name)
 
 
 def _args(**overrides):
@@ -69,6 +86,19 @@ def _complete_sample(**overrides) -> Sample:
         actual_provenance={"backend": "native", "fallback": False},
     )
     return sample
+
+
+@pytest.mark.unit
+def test_consistency_metadata_helpers_do_not_import_rl_engine():
+    _drop_rl_engine_modules()
+    sample = _complete_sample()
+
+    validation = validate_samples_consistency_metadata([sample], mode="strict")
+
+    assert validation.ok
+    assert "alignment_profile" not in sample.consistency_metadata
+    assert "ScoreArtifact" not in sample.consistency_metadata
+    assert not any(name == "rl_engine" or name.startswith("rl_engine.") for name in sys.modules)
 
 
 @pytest.mark.unit

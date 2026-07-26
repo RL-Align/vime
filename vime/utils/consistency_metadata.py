@@ -5,6 +5,10 @@ shipping full token or mask payloads inside metadata records. Full tensors
 continue to live in the existing training batch fields; metadata carries
 stable fingerprints, active-token counts, and requested-vs-actual provenance
 needed by audit/strict consistency checks.
+
+This is intentionally vime runtime metadata. RL-Kernel-owned alignment schemas,
+A0-A5 profiles, comparators, and tolerance contracts stay behind the
+``vime.backends.rl_kernel_utils`` adapter boundary.
 """
 
 from __future__ import annotations
