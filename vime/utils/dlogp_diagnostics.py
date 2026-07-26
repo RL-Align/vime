@@ -1,3 +1,10 @@
+"""Read-only dlogp audit diagnostics for vime runtime paths.
+
+These helpers intentionally stop at tensor and metadata telemetry. RL-Kernel
+owned ScoreArtifact schemas, A0-A5 profiles, comparators, and tolerance
+contracts stay behind adapter imports instead of being reimplemented here.
+"""
+
 from __future__ import annotations
 
 import os

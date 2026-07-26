@@ -39,6 +39,12 @@ MEGATRON_STUB_MODULES = (
 )
 
 
+def _drop_rl_engine_modules() -> None:
+    for name in list(sys.modules):
+        if name == "rl_engine" or name.startswith("rl_engine."):
+            sys.modules.pop(name)
+
+
 def _report_with_full_metadata(**kwargs):
     return compute_dlogp_diagnostics(
         model_name=FULL_METADATA["model_name"],
@@ -48,6 +54,25 @@ def _report_with_full_metadata(**kwargs):
         provenance_fingerprint=FULL_METADATA["provenance_fingerprint"],
         **kwargs,
     )
+
+
+@pytest.mark.unit
+def test_dlogp_diagnostics_do_not_import_rl_engine():
+    _drop_rl_engine_modules()
+    module = importlib.reload(importlib.import_module("vime.utils.dlogp_diagnostics"))
+
+    report = module.compute_dlogp_diagnostics(
+        train_log_probs=[torch.tensor([-1.0, -2.0])],
+        rollout_log_probs=[torch.tensor([-1.0, -2.1])],
+        loss_masks=[torch.tensor([1, 1])],
+        metadata=[FULL_METADATA],
+    )
+
+    assert report.metrics["rlk_audit_active_token_count"].item() == pytest.approx(2.0)
+    assert report.worst_token is not None
+    assert "alignment_profile" not in report.worst_token
+    assert "ScoreArtifact" not in report.worst_token
+    assert not any(name == "rl_engine" or name.startswith("rl_engine.") for name in sys.modules)
 
 
 @pytest.fixture()
