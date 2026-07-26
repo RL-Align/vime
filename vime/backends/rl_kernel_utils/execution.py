@@ -1,3 +1,10 @@
+"""Framework-owned execution decision records for optional RL-Kernel paths.
+
+This module intentionally does not import ``rl_engine``. vime owns mode
+selection, native fallback decisions, and reportable runtime provenance here;
+RL-Kernel-owned capability data must be supplied through an explicit provider.
+"""
+
 import hashlib
 import json
 import logging

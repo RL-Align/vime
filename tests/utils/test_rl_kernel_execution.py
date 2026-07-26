@@ -1,5 +1,6 @@
 import json
 import logging
+import sys
 
 import pytest
 
@@ -16,6 +17,12 @@ from vime.backends.rl_kernel_utils import (
     select_execution_decision,
 )
 from vime.backends.rl_kernel_utils.execution import RLK_DECISION_EVENT
+
+
+def _drop_rl_engine_modules() -> None:
+    for name in list(sys.modules):
+        if name == "rl_engine" or name.startswith("rl_engine."):
+            sys.modules.pop(name)
 
 
 def _contract(contract_id: str = "rlk.linear_logp.fp32") -> NumericContract:
@@ -61,6 +68,16 @@ def _backend(
 
 def _caps(*backends: BackendCapability) -> RlKernelCapabilities:
     return RlKernelCapabilities(available=True, backends=tuple(backends))
+
+
+@pytest.mark.unit
+def test_execution_helpers_do_not_import_rl_engine():
+    _drop_rl_engine_modules()
+
+    result = query_rl_kernel_capabilities()
+
+    assert result.capabilities.available is False
+    assert not any(name == "rl_engine" or name.startswith("rl_engine.") for name in sys.modules)
 
 
 @pytest.mark.unit
