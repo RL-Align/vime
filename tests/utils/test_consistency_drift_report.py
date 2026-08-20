@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -8,11 +9,13 @@ import torch
 from vime.utils.consistency_drift_report import (
     build_consistency_drift_report,
     build_consistency_drift_trace,
+    load_consistency_drift_bundle,
     render_consistency_drift_report,
     render_consistency_drift_report_image,
     write_consistency_drift_report,
     write_consistency_drift_trace,
     write_consistency_drift_report_image,
+    write_consistency_drift_bundle,
 )
 
 
@@ -155,3 +158,48 @@ def test_consistency_trace_is_expandable_chrome_trace_json(tmp_path: Path):
 
     output = write_consistency_drift_trace(report, tmp_path / "drift.json")
     assert output.read_text(encoding="utf-8").startswith("{\n  \"traceEvents\"")
+
+
+@pytest.mark.unit
+def test_consistency_bundle_contains_report_trace_and_preview(tmp_path: Path):
+    manifest, cube = _artifacts()
+    report = build_consistency_drift_report(replay_manifest=manifest, result_cube=cube)
+
+    output = write_consistency_drift_bundle(report, tmp_path / "drift.vime-drift")
+    assert output.exists()
+
+    import zipfile
+
+    with zipfile.ZipFile(output) as archive:
+        assert set(archive.namelist()) == {
+            "manifest.json",
+            "report.json",
+            "trace.json",
+            "preview.png",
+        }
+
+    loaded = load_consistency_drift_bundle(output)
+    assert loaded["manifest"]["format"] == "vime.consistency-drift"
+    assert loaded["manifest"]["preview_included"] is True
+    assert loaded["report"]["status"] == "warning"
+    assert loaded["trace"]["metadata"]["timeline_mode"] == "ordinal_diagnostic"
+
+
+@pytest.mark.unit
+def test_consistency_bundle_can_omit_preview(tmp_path: Path):
+    manifest, cube = _artifacts()
+    report = build_consistency_drift_report(replay_manifest=manifest, result_cube=cube)
+
+    output = write_consistency_drift_bundle(
+        report,
+        tmp_path / "drift-no-preview.vime-drift",
+        include_preview=False,
+    )
+
+    import zipfile
+
+    with zipfile.ZipFile(output) as archive:
+        assert "preview.png" not in archive.namelist()
+        bundle_manifest = json.loads(archive.read("manifest.json"))
+    assert bundle_manifest["preview_included"] is False
+    assert bundle_manifest["files"] == ["manifest.json", "report.json", "trace.json"]

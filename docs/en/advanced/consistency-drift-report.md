@@ -40,6 +40,39 @@ This file is not an `.nsys-rep` file. Nsight Systems report files are generated
 by the Nsight collector and are not a public interchange format; the JSON trace
 is the portable equivalent for vime consistency diagnostics.
 
+## Open a local expandable report
+
+For day-to-day debugging, package the same report into one offline
+`.vime-drift` file. The bundle contains the sanitized report, the expandable
+trace, and (unless disabled) the PNG snapshot. It does not copy the original
+training or rollout dumps.
+
+Install the optional desktop viewer once:
+
+```bash
+pip install "vime[consistency-viewer]"
+```
+
+Build and open the bundle locally:
+
+```bash
+python tools/consistency_drift_bundle.py \
+  /path/to/train_data/12_0.pt /path/to/train_data/12_1.pt \
+  --output /path/to/consistency-drift.vime-drift
+vime-consistency-view /path/to/consistency-drift.vime-drift
+```
+
+The viewer runs as a native desktop window with collapsible audit tracks,
+timeline zoom/scroll, selectable events, and an event-details panel. It needs
+no browser, local web server, or network connection at viewing time. The PNG
+inside the bundle remains the compact artifact for a PR or issue; the bundle is
+the richer artifact for interactive diagnosis. The equivalent module command
+is also available:
+
+```bash
+python -m vime.utils.consistency_drift_viewer /path/to/consistency-drift.vime-drift
+```
+
 ## How to read the view
 
 - **Training audit** covers the comparison represented by the result cube.

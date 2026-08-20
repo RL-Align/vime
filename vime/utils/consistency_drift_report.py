@@ -9,7 +9,9 @@ the timeline uses stable sample ordinals and labels that mode explicitly.
 from __future__ import annotations
 
 import html
+import io
 import json
+import zipfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -329,6 +331,62 @@ def write_consistency_drift_trace(report: Mapping[str, Any], path: str | Path) -
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(build_consistency_drift_trace(report), ensure_ascii=True, indent=2), encoding="utf-8")
     return output
+
+
+def write_consistency_drift_bundle(
+    report: Mapping[str, Any],
+    path: str | Path,
+    *,
+    include_preview: bool = True,
+) -> Path:
+    """Write a self-contained ``.vime-drift`` desktop-viewer bundle.
+
+    The bundle contains sanitized report JSON and a portable trace.  The PNG
+    preview is included for PR/issue sharing but is not required by the viewer.
+    Raw train dumps are intentionally not copied into the bundle.
+    """
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    normalized = _plain_mapping(report)
+    trace = build_consistency_drift_trace(normalized)
+    manifest = {
+        "format": "vime.consistency-drift",
+        "bundle_version": 1,
+        "report_schema_version": normalized.get("schema_version", REPORT_SCHEMA_VERSION),
+        "files": [
+            "manifest.json",
+            "report.json",
+            "trace.json",
+            *(["preview.png"] if include_preview else []),
+        ],
+        "preview_included": bool(include_preview),
+        "title": normalized.get("title", "Consistency drift report"),
+        "status": normalized.get("status", "info"),
+    }
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=True, indent=2))
+        archive.writestr("report.json", json.dumps(normalized, ensure_ascii=True, indent=2))
+        archive.writestr("trace.json", json.dumps(trace, ensure_ascii=True, indent=2))
+        if include_preview:
+            preview = render_consistency_drift_report_image(normalized)
+            buffer = io.BytesIO()
+            preview.save(buffer, format="PNG", optimize=True)
+            archive.writestr("preview.png", buffer.getvalue())
+    return output
+
+
+def load_consistency_drift_bundle(path: str | Path) -> dict[str, Any]:
+    """Load a ``.vime-drift`` bundle without importing the optional GUI."""
+
+    with zipfile.ZipFile(path, "r") as archive:
+        names = set(archive.namelist())
+        if "report.json" not in names or "trace.json" not in names:
+            raise ValueError("invalid vime consistency drift bundle: report.json and trace.json are required")
+        report = json.loads(archive.read("report.json"))
+        trace = json.loads(archive.read("trace.json"))
+        manifest = json.loads(archive.read("manifest.json")) if "manifest.json" in names else {}
+    return {"manifest": manifest, "report": report, "trace": trace}
 
 
 def render_consistency_drift_report(report: Mapping[str, Any]) -> str:

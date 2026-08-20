@@ -36,7 +36,14 @@ setup(
     packages=find_packages(include=["vime*", "vime_plugins*"]),
     include_package_data=True,
     install_requires=_fetch_requirements("requirements.txt"),
-    extras_require={},
+    extras_require={
+        "consistency-viewer": ["PySide6>=6.6"],
+    },
+    entry_points={
+        "console_scripts": [
+            "vime-consistency-view=vime.utils.consistency_drift_viewer:main",
+        ],
+    },
     python_requires=">=3.10",
     classifiers=[
         "Programming Language :: Python :: 3.10",
