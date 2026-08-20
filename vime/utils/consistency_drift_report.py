@@ -194,6 +194,143 @@ def build_consistency_drift_report(
     }
 
 
+def build_consistency_drift_trace(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a consistency report into Chrome Trace Event JSON.
+
+    The resulting file can be opened directly in Perfetto and expanded by
+    process/thread track.  It deliberately uses the report's timestamp mode;
+    ordinal reports remain diagnostic sample positions, never fabricated time.
+    """
+
+    normalized = _plain_mapping(report)
+    events = [_plain_mapping(event) for event in normalized.get("events", [])]
+    status = str(normalized.get("status", "info"))
+    timeline_mode = str(normalized.get("timeline_mode", "ordinal_diagnostic"))
+    lanes = [
+        ("Audit", None),
+        ("Training audit", "Training audit"),
+        ("Rollout samples", "Rollout samples"),
+        ("Execution", None),
+        ("Operator / backend", "Operator / backend"),
+        ("Token comparison", "Token comparison"),
+        ("Validation", None),
+        ("Drift markers", "Drift markers"),
+    ]
+    lane_ids = {name: 100 + index for index, (name, _) in enumerate(lanes)}
+    process_id = 1
+    trace_events: list[dict[str, Any]] = [
+        {
+            "name": "process_name",
+            "ph": "M",
+            "pid": process_id,
+            "args": {"name": "VIME consistency drift"},
+        },
+    ]
+    for lane, event_lane in lanes:
+        if event_lane is None:
+            continue
+        trace_events.append(
+            {
+                "name": "thread_name",
+                "ph": "M",
+                "pid": process_id,
+                "tid": lane_ids[lane],
+                "args": {"name": lane},
+            }
+        )
+
+    def trace_time(value: Any) -> float:
+        number = _number(value, default=0.0) or 0.0
+        # Chrome Trace timestamps are microseconds.  In ordinal mode the same
+        # scale is retained only to make adjacent sample positions visible.
+        return number * 1_000_000.0
+
+    event_colors = {
+        "pass": "good",
+        "warning": "terrible",
+        "failure": "bad",
+        "info": "thread_state_running",
+    }
+    for event in events:
+        event_lane = str(event.get("lane", "Drift markers"))
+        tid = lane_ids.get(event_lane, lane_ids["Drift markers"])
+        start = _number(event.get("start"), default=0.0) or 0.0
+        end = _number(event.get("end"), default=start) or start
+        details = event.get("details") if isinstance(event.get("details"), Mapping) else {}
+        args = {
+            "event_id": str(event.get("id", "")),
+            "status": str(event.get("status", status)),
+            "timeline_mode": timeline_mode,
+            "timeline_note": normalized.get("timeline_note", ""),
+            "details": details,
+        }
+        color = event_colors.get(str(event.get("status", "info")), "thread_state_running")
+        if event.get("kind") == "marker":
+            trace_events.append(
+                {
+                    "name": str(event.get("label", "marker")),
+                    "cat": "consistency.drift",
+                    "ph": "I",
+                    "s": "t",
+                    "pid": process_id,
+                    "tid": tid,
+                    "ts": trace_time(start),
+                    "cname": color,
+                    "args": args,
+                }
+            )
+            continue
+        trace_events.append(
+            {
+                "name": str(event.get("label", event.get("id", "event"))),
+                "cat": "consistency.audit",
+                "ph": "X",
+                "pid": process_id,
+                "tid": tid,
+                "ts": trace_time(start),
+                "dur": max(1.0, trace_time(end) - trace_time(start)),
+                "cname": color,
+                "args": args,
+            }
+        )
+
+    metrics = normalized.get("metrics") if isinstance(normalized.get("metrics"), Mapping) else {}
+    max_abs_dlogp = _number(metrics.get("max_abs_dlogp"))
+    if max_abs_dlogp is not None:
+        trace_events.append(
+            {
+                "name": "max |dlogp|",
+                "cat": "consistency.metric",
+                "ph": "C",
+                "pid": process_id,
+                "tid": lane_ids["Token comparison"],
+                "ts": 0.0,
+                "args": {"max_abs_dlogp": max_abs_dlogp},
+            }
+        )
+
+    return {
+        "traceEvents": trace_events,
+        "displayTimeUnit": "ms",
+        "metadata": {
+            "report_title": normalized.get("title", "Consistency drift report"),
+            "status": status,
+            "timeline_mode": timeline_mode,
+            "timeline_note": normalized.get("timeline_note", ""),
+            "schema_version": normalized.get("schema_version", REPORT_SCHEMA_VERSION),
+        },
+    }
+
+
+def write_consistency_drift_trace(report: Mapping[str, Any], path: str | Path) -> Path:
+    """Write a Chrome Trace Event JSON file for Perfetto or trace viewers."""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(build_consistency_drift_trace(report), ensure_ascii=True, indent=2), encoding="utf-8")
+    return output
+
+
 def render_consistency_drift_report(report: Mapping[str, Any]) -> str:
     """Render a report as a self-contained HTML document with an SVG timeline."""
 

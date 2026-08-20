@@ -7,9 +7,11 @@ import torch
 
 from vime.utils.consistency_drift_report import (
     build_consistency_drift_report,
+    build_consistency_drift_trace,
     render_consistency_drift_report,
     render_consistency_drift_report_image,
     write_consistency_drift_report,
+    write_consistency_drift_trace,
     write_consistency_drift_report_image,
 )
 
@@ -138,3 +140,18 @@ def test_static_report_image_is_shareable_png(tmp_path: Path):
 
     output = write_consistency_drift_report_image(report, tmp_path / "drift.png")
     assert output.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+@pytest.mark.unit
+def test_consistency_trace_is_expandable_chrome_trace_json(tmp_path: Path):
+    manifest, cube = _artifacts()
+    report = build_consistency_drift_report(replay_manifest=manifest, result_cube=cube)
+
+    trace = build_consistency_drift_trace(report)
+    assert trace["metadata"]["timeline_mode"] == "ordinal_diagnostic"
+    assert any(event.get("ph") == "M" and event.get("name") == "thread_name" for event in trace["traceEvents"])
+    assert any(event.get("ph") == "X" and event.get("cat") == "consistency.audit" for event in trace["traceEvents"])
+    assert any(event.get("ph") == "I" and event.get("cat") == "consistency.drift" for event in trace["traceEvents"])
+
+    output = write_consistency_drift_trace(report, tmp_path / "drift.json")
+    assert output.read_text(encoding="utf-8").startswith("{\n  \"traceEvents\"")
