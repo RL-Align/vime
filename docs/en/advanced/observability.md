@@ -100,4 +100,4 @@ The default path does not require separate `ReqTimeStats(...)` logs, Loki, or a 
 
 For numerical train/rollout agreement, use the [consistency drift report](consistency-drift-report.md).
 It reuses the audit artifacts in debug dumps and presents training, rollout,
-operator, and drift-marker lanes in a self-contained HTML timeline.
+operator, and drift-marker lanes in a static profiler-style image.

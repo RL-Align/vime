@@ -1,9 +1,9 @@
 # Consistency Drift Report
 
 vime can turn the consistency audit artifacts already present in debug dumps
-into a self-contained HTML report. The view is designed for post-training
-debugging: it is organized like a profiler timeline, but it reports numerical
-agreement and execution provenance rather than GPU kernel duration.
+into a static PNG report. The image is designed for post-training debugging:
+it uses a profiler-style track layout, but it reports numerical agreement and
+execution provenance rather than GPU kernel duration.
 
 ## Generate a report
 
@@ -13,21 +13,23 @@ rank dumps produces one combined view.
 ```bash
 python tools/consistency_drift_report.py \
   /path/to/train_data/12_0.pt /path/to/train_data/12_1.pt \
-  --output /path/to/consistency-drift.html
+  --output /path/to/consistency-drift.png
 ```
 
-Open the generated HTML directly in a browser. It has no JavaScript package,
-font, or network dependency.
+The generated PNG is a single shareable image. It has no browser, JavaScript,
+font, or network dependency at viewing time. JPEG output is also supported by
+using a `.jpg` or `.jpeg` suffix.
 
 ## How to read the view
 
 - **Training audit** covers the comparison represented by the result cube.
-- **Rollout samples** shows the sample/replay order and lets you inspect the
-  sample metadata from the dump.
+- **Rollout samples** shows the sample/replay order and the sample metadata
+  captured in the dump.
 - **Operator / backend** shows the actual backend when provenance is available;
   requested backend is only a fallback label.
 - **Drift markers** identify the worst `|dlogp|` token and validation warnings or
-  failures. Selecting any bar or marker opens its details below the timeline.
+  failures. The lower panels keep the selected anomaly, axes, and provenance
+  visible in the image itself so the report can be pasted into a PR or issue.
 
 The report status is `PASS`, `WARN`, or `FAIL` and is also written as text, not
 only as color. A report with no real timestamps uses the explicit

@@ -8,7 +8,9 @@ import torch
 from vime.utils.consistency_drift_report import (
     build_consistency_drift_report,
     render_consistency_drift_report,
+    render_consistency_drift_report_image,
     write_consistency_drift_report,
+    write_consistency_drift_report_image,
 )
 
 
@@ -123,3 +125,16 @@ def test_debug_dump_loader_derives_drift_when_cube_was_not_serialized(tmp_path: 
     assert cube["metrics"]["active_token_count"] == 2.0
     assert cube["metrics"]["max_abs_dlogp"] == pytest.approx(0.3)
     assert cube["worst_token"]["token_position"] == 1
+
+
+@pytest.mark.unit
+def test_static_report_image_is_shareable_png(tmp_path: Path):
+    pytest.importorskip("PIL")
+    manifest, cube = _artifacts()
+    report = build_consistency_drift_report(replay_manifest=manifest, result_cube=cube)
+
+    image = render_consistency_drift_report_image(report)
+    assert image.size == (2400, 1680)
+
+    output = write_consistency_drift_report_image(report, tmp_path / "drift.png")
+    assert output.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"

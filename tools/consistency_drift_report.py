@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Render vime consistency audit dumps as a self-contained drift report."""
+"""Render vime consistency audit dumps as a static profiler-style image."""
 
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import torch
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from vime.utils.consistency_drift_report import (
     build_consistency_drift_report,
-    write_consistency_drift_report,
+    write_consistency_drift_report_image,
 )
 
 
@@ -38,7 +42,13 @@ def load_consistency_artifacts(paths: Sequence[str | Path]) -> tuple[dict[str, A
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="+", type=Path, help="vime debug .pt dump(s)")
-    parser.add_argument("-o", "--output", type=Path, required=True, help="output HTML path")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="output image path (.png, .jpg, or .jpeg)",
+    )
     parser.add_argument("--title", default=None, help="report title")
     args = parser.parse_args()
 
@@ -49,8 +59,10 @@ def main() -> None:
         runtime_provenance=provenance,
         title=args.title,
     )
-    output = write_consistency_drift_report(report, args.output)
-    print(f"Wrote consistency drift report to {output}")
+    if args.output.suffix.lower() == ".html":
+        parser.error("the consistency drift report is an image; use a .png, .jpg, or .jpeg output path")
+    output = write_consistency_drift_report_image(report, args.output)
+    print(f"Wrote consistency drift image to {output}")
 
 
 def _torch_load(path: Path) -> Any:

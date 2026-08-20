@@ -23,6 +23,25 @@ _STATUS_COLORS = {
     "failure": "#ff5c77",
     "info": "#70a7ff",
 }
+_REPORT_IMAGE_COLORS = {
+    "background": "#17191f",
+    "panel": "#24272e",
+    "panel_alt": "#2b2e36",
+    "track": "#3a3e47",
+    "line": "#464b56",
+    "grid": "#383d47",
+    "text": "#f1f3f5",
+    "muted": "#a3a8b3",
+    "green": "#3bd391",
+    "yellow": "#f0b94b",
+    "red": "#ed657b",
+    "blue": "#5b8def",
+    "purple": "#9b8afb",
+    "pass": "#3bd391",
+    "warning": "#f0b94b",
+    "failure": "#ed657b",
+    "info": "#5b8def",
+}
 
 
 def build_consistency_drift_report(
@@ -307,6 +326,260 @@ def write_consistency_drift_report(report: Mapping[str, Any], path: str | Path) 
     return output
 
 
+def render_consistency_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -> Any:
+    """Render a static profiler-style report image.
+
+    The image is intentionally self-contained and suitable for attaching to a
+    PR, issue, or debug artifact.  It follows the visual grammar of profiler
+    screenshots: a fixed dark canvas, track labels on the left, a ruler and
+    aligned tracks in the middle, and structured diagnostic tables below.
+    """
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    normalized = _plain_mapping(report)
+    metrics = normalized.get("metrics") if isinstance(normalized.get("metrics"), Mapping) else {}
+    events = [_plain_mapping(event) for event in normalized.get("events", [])]
+    status = str(normalized.get("status", "info"))
+    status_color = _REPORT_IMAGE_COLORS.get(status, _REPORT_IMAGE_COLORS["info"])
+    bg = _REPORT_IMAGE_COLORS["background"]
+    panel_bg = _REPORT_IMAGE_COLORS["panel"]
+    panel_alt = _REPORT_IMAGE_COLORS["panel_alt"]
+    line = _REPORT_IMAGE_COLORS["line"]
+    text_color = _REPORT_IMAGE_COLORS["text"]
+    muted = _REPORT_IMAGE_COLORS["muted"]
+
+    height = 1680
+    image = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(image)
+    regular = _load_report_font(24)
+    small = _load_report_font(19)
+    tiny = _load_report_font(16)
+    label_font = _load_report_font(20, bold=True)
+    section_font = _load_report_font(25, bold=True)
+    title_font = _load_report_font(42, bold=True)
+    metric_font = _load_report_font(34, bold=True)
+    mono = _load_report_font(17, mono=True)
+
+    def rect(box: tuple[int, int, int, int], fill: str, radius: int = 12, outline: str | None = None) -> None:
+        draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=2 if outline else 1)
+
+    def write(x: int, y: int, value: Any, font: Any = regular, fill: str = text_color, anchor: str | None = None) -> None:
+        draw.text((x, y), str(value), font=font, fill=fill, anchor=anchor)
+
+    def fit(value: Any, limit: int) -> str:
+        return _truncate(str(value), limit)
+
+    def key_value_rows(values: Any, limit: int = 33) -> list[tuple[str, str]]:
+        if not isinstance(values, Mapping):
+            return []
+        return [(fit(key, limit), fit(_format_value(values[key]), 47)) for key in sorted(values, key=str)]
+
+    # Header: compact profiler chrome and a readable status badge.
+    write(44, 26, "VIME / CONSISTENCY AUDIT", tiny, muted)
+    write(44, 52, normalized.get("title", "Consistency drift report"), title_font)
+    write(46, 112, normalized.get("timeline_note", ""), small, muted)
+    badge_text = _STATUS_LABELS.get(status, status.upper())
+    badge_width = 150
+    rect((width - badge_width - 44, 45, width - 44, 100), bg, 14, status_color)
+    write(width - badge_width // 2 - 44, 72, badge_text, label_font, status_color, anchor="mm")
+
+    # Summary cards, aligned like a profiler overview strip.
+    card_y = 150
+    card_gap = 16
+    card_width = (width - 88 - card_gap * 3) // 4
+    cards = [
+        ("MAX |DLOGP|", _format_number(metrics.get("max_abs_dlogp")), status_color),
+        ("ACTIVE TOKENS", _format_number(metrics.get("active_token_count")), _REPORT_IMAGE_COLORS["blue"]),
+        ("WARNINGS", _format_number(metrics.get("warning_count"), default="0"), _REPORT_IMAGE_COLORS["yellow"]),
+        ("REPLAY CASES", normalized.get("replay_case_count", 0), _REPORT_IMAGE_COLORS["purple"]),
+    ]
+    for index, (name, value, accent) in enumerate(cards):
+        x0 = 44 + index * (card_width + card_gap)
+        rect((x0, card_y, x0 + card_width, card_y + 112), panel_bg, 10, line)
+        draw.rectangle((x0, card_y, x0 + 8, card_y + 112), fill=accent)
+        write(x0 + 28, card_y + 20, name, tiny, muted)
+        write(x0 + 28, card_y + 53, value, metric_font)
+
+    # Timeline panel: left track labels + ruler + aligned events.
+    timeline_y = 292
+    timeline_h = 610
+    rect((44, timeline_y, width - 44, timeline_y + timeline_h), panel_bg, 10, line)
+    write(70, timeline_y + 24, "TIMELINE", section_font)
+    write(235, timeline_y + 29, "operator drift", small, muted)
+    mode = str(normalized.get("timeline_mode", "diagnostic"))
+    mode_color = _REPORT_IMAGE_COLORS["yellow"] if mode != "timestamp" else _REPORT_IMAGE_COLORS["blue"]
+    write(width - 76, timeline_y + 31, mode, tiny, mode_color, anchor="ra")
+
+    lanes = ["Training audit", "Rollout samples", "Operator / backend", "Token comparison", "Drift markers"]
+    left = 350
+    right = width - 78
+    ruler_y = timeline_y + 87
+    chart_top = timeline_y + 118
+    row_height = 76
+    chart_bottom = chart_top + row_height * len(lanes)
+    max_end = max((_number(event.get("end"), default=1.0) or 1.0 for event in events), default=1.0)
+    span = max(1.0, max_end)
+
+    def x_for(value: float) -> int:
+        return int(left + max(0.0, min(span, value)) / span * (right - left))
+
+    # Group header and time ruler.
+    write(70, ruler_y - 5, "AUDIT / REPLAY", tiny, muted)
+    draw.line((left, ruler_y + 15, right, ruler_y + 15), fill=line, width=2)
+    for tick in range(0, 9):
+        value = span * tick / 8
+        xpos = x_for(value)
+        draw.line((xpos, ruler_y + 15, xpos, chart_bottom), fill=_REPORT_IMAGE_COLORS["grid"], width=1)
+        write(xpos, ruler_y - 2, _format_number(value), tiny, muted, anchor="ma")
+
+    for lane_index, lane in enumerate(lanes):
+        y0 = chart_top + lane_index * row_height
+        if lane_index % 2 == 0:
+            draw.rectangle((left, y0, right, y0 + row_height), fill=panel_alt)
+        write(70, y0 + 28, lane.upper(), tiny, text_color)
+        draw.line((left, y0 + row_height, right, y0 + row_height), fill=line, width=1)
+
+    event_colors = {
+        "pass": _REPORT_IMAGE_COLORS["green"],
+        "warning": _REPORT_IMAGE_COLORS["yellow"],
+        "failure": _REPORT_IMAGE_COLORS["red"],
+        "info": _REPORT_IMAGE_COLORS["blue"],
+    }
+    for event in events:
+        lane = str(event.get("lane", "Drift markers"))
+        if lane not in lanes:
+            lane = "Drift markers"
+        lane_index = lanes.index(lane)
+        y0 = chart_top + lane_index * row_height
+        color = event_colors.get(str(event.get("status", "info")), event_colors["info"])
+        start = _number(event.get("start"), default=0.0) or 0.0
+        end = _number(event.get("end"), default=start + 0.5) or start + 0.5
+        x0 = x_for(start)
+        x1 = max(x0 + 10, x_for(end))
+        if event.get("kind") == "marker":
+            mid = x_for(start)
+            points = [(mid, y0 + 20), (mid + 12, y0 + 32), (mid, y0 + 44), (mid - 12, y0 + 32)]
+            draw.polygon(points, fill=color)
+            marker_label = fit(event.get("label", "marker"), 34)
+            if mid > right - 300:
+                write(max(left + 10, mid - 300), y0 + 23, marker_label, tiny, text_color)
+            else:
+                write(mid + 20, y0 + 23, marker_label, tiny, text_color)
+        else:
+            rect((x0, y0 + 20, x1, y0 + 52), color, 5)
+            if x1 - x0 >= 130:
+                write(x0 + 14, y0 + 27, fit(event.get("label", "event"), 35), tiny, bg)
+            else:
+                write(min(x1 + 12, right - 240), y0 + 27, fit(event.get("label", "event"), 30), tiny, text_color)
+
+    # Keep the comparison track meaningful even when the dump only contains a
+    # scalar worst-token summary instead of per-token samples.
+    worst = normalized.get("worst_token") if isinstance(normalized.get("worst_token"), Mapping) else {}
+    comparison_y = chart_top + 3 * row_height + 38
+    draw.line((left + 18, comparison_y, right - 18, comparison_y), fill=_REPORT_IMAGE_COLORS["track"], width=5)
+    write(left + 18, comparison_y - 30, "train vs rollout", tiny, muted)
+    if worst:
+        sample_position = _number(worst.get("sample_position"), default=0.0) or 0.0
+        comparison_x = x_for(sample_position + 0.5)
+        draw.line((comparison_x, comparison_y - 18, comparison_x, comparison_y + 18), fill=status_color, width=4)
+        write(comparison_x + 12, comparison_y - 11, f"delta={_format_number(worst.get('abs_dlogp'))}", tiny, status_color)
+
+    # A compact legend makes the static image readable without hover state.
+    legend_y = timeline_y + timeline_h - 35
+    write(70, legend_y, "PASS", tiny, _REPORT_IMAGE_COLORS["green"])
+    write(160, legend_y, "WARN", tiny, _REPORT_IMAGE_COLORS["yellow"])
+    write(260, legend_y, "FAIL", tiny, _REPORT_IMAGE_COLORS["red"])
+    write(360, legend_y, "INFO", tiny, _REPORT_IMAGE_COLORS["blue"])
+    write(right, legend_y, "positions are sample ordinals when timestamps are absent", tiny, muted, anchor="ra")
+
+    # Diagnostic summary panels.
+    summary_y = 930
+    summary_h = 250
+    half_gap = 18
+    half_width = (width - 88 - half_gap) // 2
+    rect((44, summary_y, 44 + half_width, summary_y + summary_h), panel_bg, 10, line)
+    rect((44 + half_width + half_gap, summary_y, width - 44, summary_y + summary_h), panel_bg, 10, line)
+    write(70, summary_y + 22, "DRIFT SUMMARY", section_font)
+    write(70, summary_y + 66, "observed maximum", tiny, muted)
+    max_value = _number(metrics.get("max_abs_dlogp"), default=0.0) or 0.0
+    bar_x = 70
+    bar_y = summary_y + 106
+    bar_width = half_width - 110
+    rect((bar_x, bar_y, bar_x + bar_width, bar_y + 24), _REPORT_IMAGE_COLORS["track"], 4)
+    fill_width = int(min(1.0, max_value / max(max_value, 1.0)) * bar_width) if max_value else 0
+    if fill_width:
+        rect((bar_x, bar_y, bar_x + max(8, fill_width), bar_y + 24), status_color, 4)
+    write(bar_x, bar_y + 36, "0", tiny, muted)
+    write(bar_x + bar_width, bar_y + 36, _format_number(max(max_value, 1.0)), tiny, muted, anchor="ra")
+    worst = normalized.get("worst_token") if isinstance(normalized.get("worst_token"), Mapping) else {}
+    worst_text = (
+        f"worst token: sample={worst.get('sample_position', '-')}  token={worst.get('token_position', '-')}  "
+        f"|dlogp|={_format_number(worst.get('abs_dlogp'))}"
+    )
+    write(70, summary_y + 174, fit(worst_text, 92), mono, text_color)
+    write(44 + half_width + half_gap + 26, summary_y + 22, "SELECTED ANOMALY", section_font)
+    warning_items = normalized.get("validation") if isinstance(normalized.get("validation"), Mapping) else {}
+    warnings = warning_items.get("warnings") or []
+    failures = warning_items.get("failures") or []
+    issue_text = "No metadata validation issues recorded."
+    if failures or warnings:
+        first = (failures or warnings)[0]
+        first = first if isinstance(first, Mapping) else {"message": first}
+        issue_text = f"{str(first.get('code', 'validation'))}: {str(first.get('message', ''))}"
+    write(44 + half_width + half_gap + 26, summary_y + 76, fit(issue_text, 88), regular, status_color)
+    write(44 + half_width + half_gap + 26, summary_y + 128, "Use the provenance block below to identify the execution path.", small, muted)
+    write(44 + half_width + half_gap + 26, summary_y + 174, f"status={badge_text}  warnings={len(warnings)}  failures={len(failures)}", mono, text_color)
+
+    # Bottom tables: axis capture and runtime provenance are the actionable part
+    # of the image for a post-training user.
+    table_y = 1210
+    table_h = 340
+    rect((44, table_y, 44 + half_width, table_y + table_h), panel_bg, 10, line)
+    rect((44 + half_width + half_gap, table_y, width - 44, table_y + table_h), panel_bg, 10, line)
+    write(70, table_y + 22, "CAPTURED EXECUTION AXES", section_font)
+    write(44 + half_width + half_gap + 26, table_y + 22, "RUNTIME PROVENANCE", section_font)
+    axes_rows = key_value_rows(normalized.get("axes"))
+    provenance_rows = key_value_rows(normalized.get("runtime_provenance"))
+
+    def table(rows: list[tuple[str, str]], x0: int, y0: int, w: int, max_rows: int = 8) -> None:
+        row_y = y0
+        for index, (key, value) in enumerate(rows[:max_rows]):
+            if index % 2 == 0:
+                draw.rectangle((x0, row_y - 3, x0 + w, row_y + 35), fill=panel_alt)
+            write(x0 + 14, row_y + 8, key, tiny, muted)
+            write(x0 + 270, row_y + 8, value, mono, text_color)
+            draw.line((x0, row_y + 38, x0 + w, row_y + 38), fill=line, width=1)
+            row_y += 39
+        if not rows:
+            write(x0 + 14, row_y + 8, "not recorded", small, muted)
+
+    table(axes_rows, 70, table_y + 74, half_width - 52)
+    table(provenance_rows, 44 + half_width + half_gap + 26, table_y + 74, half_width - 52)
+    validation_label = "VALIDATION: PASS"
+    if failures or warnings:
+        validation_label = f"VALIDATION: {badge_text} | {fit(issue_text, 86)}"
+    write(70, height - 58, validation_label, tiny, status_color)
+    footer = "static diagnostic image | schema v" + str(normalized.get("schema_version", REPORT_SCHEMA_VERSION))
+    write(width - 54, height - 28, footer, tiny, muted, anchor="ra")
+    return image
+
+
+def write_consistency_drift_report_image(report: Mapping[str, Any], path: str | Path) -> Path:
+    """Write a static PNG/JPEG consistency drift report image."""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image = render_consistency_drift_report_image(report)
+    suffix = output.suffix.lower()
+    image_format = "JPEG" if suffix in {".jpg", ".jpeg"} else "PNG"
+    if image_format == "JPEG":
+        image.save(output, format=image_format, quality=95, optimize=True)
+    else:
+        image.save(output, format=image_format, optimize=True)
+    return output
+
+
 def _render_key_value_table(values: Any, *, empty: str) -> str:
     if not isinstance(values, Mapping) or not values:
         return f'<div class="empty">{html.escape(empty)}</div>'
@@ -378,3 +651,40 @@ def _format_value(value: Any) -> str:
 
 def _truncate(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[: max(1, limit - 1)] + "…"
+
+
+def _load_report_font(size: int, *, bold: bool = False, mono: bool = False) -> Any:
+    """Load a platform font with deterministic fallbacks for report images."""
+
+    from PIL import ImageFont
+
+    candidates = []
+    if mono:
+        candidates.extend(
+            [
+                "C:/Windows/Fonts/consola.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            ]
+        )
+    elif bold:
+        candidates.extend(
+            [
+                "C:/Windows/Fonts/segoeuib.ttf",
+                "C:/Windows/Fonts/arialbd.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                "C:/Windows/Fonts/segoeui.ttf",
+                "C:/Windows/Fonts/arial.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ]
+        )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
