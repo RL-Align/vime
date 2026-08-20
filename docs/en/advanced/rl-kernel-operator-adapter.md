@@ -25,11 +25,19 @@ Future `linear_logp` integration work should extend this adapter package rather 
 
 ## Alignment Standard Boundary
 
-The A0-A5 alignment profile matrix is owned by RL-Kernel. vime imports it through
-`rl_engine.alignment.cross_config.get_alignment_standard()` and normalizes the
-returned object in `vime.backends.rl_kernel_utils.standard`.
+The module mismatch matrix is owned by RL-Kernel. vime reads the public
+`rl_engine.alignment.cross_config.debug_matrix.module_debug_matrix()` manifest
+through `vime.backends.rl_kernel_utils.standard`; it does not carry a local
+copy of Attention, FFN, or logprob mismatch axes.
 
-Keep vime-side changes minimal by putting RL-Kernel imports in this adapter
-boundary only. Training, rollout, and operator code should pass vime-owned
-records into the adapter and let RL-Kernel own the profile definitions,
-score-artifact schema, comparator, and tolerance fingerprints.
+`iter_operator_ablation_cases(module)` describes exactly four cases for one
+module at a time: `P/P`, `R/R`, `P/R`, and `R/P`. `P` means the production
+implementation and `R` means the RL-Kernel implementation, with the training
+side written first. The case record includes only the matrix's stable axis IDs;
+the detailed probe definitions, comparability gates, and tolerances remain in
+RL-Kernel.
+
+This adapter is intentionally descriptive. It neither changes vime scheduling
+nor claims that an operator is installed on a side where vime has no runtime
+hook. The runner must record actual train/rollout provenance before treating a
+case as a completed measurement.

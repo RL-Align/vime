@@ -48,13 +48,18 @@ from vime.backends.rl_kernel_utils.operator_comparison import (
     load_operator_comparison_module,
 )
 from vime.backends.rl_kernel_utils.standard import (
+    OperatorAblationCase,
+    RlkAlignmentStandard,
     RlkAlignmentStandardUnavailable,
     alignment_standard_metadata,
     build_standard_score_artifact,
     compare_standard_score_records,
     iter_alignment_profiles,
+    iter_operator_ablation_cases,
     load_alignment_standard,
+    load_operator_ablation_matrix,
     select_least_restrictive_passing_profile,
+    select_operator_ablation_case,
 )
 
 _OPERATOR_COMPARISON_EXPORTS = frozenset(
@@ -151,7 +156,8 @@ __all__ = [
     "runtime_batch_metadata_from_vime_batch",
     "RlkOperatorComparisonUnavailable",
     "load_operator_comparison_module",
-    "iter_alignment_profiles",
+    "OperatorAblationCase",
+    "RlkAlignmentStandard",
     "BatchInvarianceCase",
     "ForwardChainComparisonResult",
     "ForwardChainStep",
@@ -199,6 +205,10 @@ __all__ = [
     "alignment_standard_metadata",
     "build_standard_score_artifact",
     "compare_standard_score_records",
+    "iter_alignment_profiles",
+    "iter_operator_ablation_cases",
     "load_alignment_standard",
+    "load_operator_ablation_matrix",
     "select_least_restrictive_passing_profile",
+    "select_operator_ablation_case",
 ]
