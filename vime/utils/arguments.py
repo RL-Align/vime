@@ -257,6 +257,24 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--selected-logprob-provider",
+                type=str,
+                default=None,
+                help=(
+                    "Optional import path for a selected-logprob provider callable. The callable receives Vime's "
+                    "normalized local logits, targets, and TP/CP ownership metadata."
+                ),
+            )
+            parser.add_argument(
+                "--selected-logprob-provider-mode",
+                choices=["auto", "strict"],
+                default="auto",
+                help=(
+                    "'auto' falls back to Vime's native selected-logprob implementation when the provider is "
+                    "unavailable; 'strict' fails instead. Provider execution and contract errors always fail."
+                ),
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",
