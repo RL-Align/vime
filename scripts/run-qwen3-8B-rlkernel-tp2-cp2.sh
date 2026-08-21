@@ -14,7 +14,8 @@ if [[ ! -f "${RL_KERNEL_ROOT}/rl_engine/integrations/vime/logp.py" ]]; then
 fi
 
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="${RL_KERNEL_ROOT}:${VIME_ROOT}:/root/Megatron-LM:${PYTHONPATH:-}"
+MEGATRON_ROOT="${MEGATRON_ROOT:-/root/Megatron-LM}"
+export PYTHONPATH="${RL_KERNEL_ROOT}:${VIME_ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
 
 # The provider is a vocab-parallel TP implementation.  CP owns token rows and
 # must not be used as a vocabulary reduction group.
@@ -22,8 +23,19 @@ TP_SIZE="${TP_SIZE:-2}"
 CP_SIZE="${CP_SIZE:-2}"
 ACTOR_GPUS="${ACTOR_GPUS:-4}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
+NUM_GPUS="${NUM_GPUS:-8}"
 ROLLOUT_GPUS_PER_ENGINE="${ROLLOUT_GPUS_PER_ENGINE:-2}"
 ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
+COLOCATE="${COLOCATE:-0}"
+
+if [[ "${NUM_GPUS}" != "8" || "${ACTOR_GPUS}" != "4" || "${ROLLOUT_GPUS}" != "4" ]]; then
+  echo "This validation entry point requires an 8-GPU node with 4 actor GPUs and 4 rollout GPUs" >&2
+  exit 2
+fi
+if [[ "${COLOCATE}" != "0" && "${COLOCATE}" != "1" ]]; then
+  echo "COLOCATE must be 0 (default, disjoint train/rollout GPUs) or 1" >&2
+  exit 2
+fi
 
 if [[ "${TP_SIZE}" != "2" || "${CP_SIZE}" != "2" ]]; then
   echo "This validation entry point is intentionally fixed to TP=2, CP=2" >&2
@@ -40,6 +52,39 @@ MODEL_ROOT="${MODEL_ROOT:-/root/Qwen3-8B}"
 TORCH_DIST_ROOT="${TORCH_DIST_ROOT:-/root/Qwen3-8B_torch_dist}"
 VIME_CKPT="${VIME_CKPT:-/root/Qwen3-8B_vime_rlkernel_tp2_cp2}"
 PROMPT_DATA="${PROMPT_DATA:-/root/dapo-math-17k/dapo-math-17k.jsonl}"
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "nvidia-smi is required; refusing to run the CUDA validation on an unknown device" >&2
+  exit 3
+fi
+GPU_NAMES="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)"
+GPU_COUNT="$(printf '%s\n' "${GPU_NAMES}" | sed '/^$/d' | wc -l | tr -d ' ')"
+if [[ "${GPU_COUNT}" != "${NUM_GPUS}" ]]; then
+  echo "Expected ${NUM_GPUS} visible GPUs, found ${GPU_COUNT}" >&2
+  printf '%s\n' "${GPU_NAMES}" >&2
+  exit 3
+fi
+if [[ "${GPU_REQUIRE_H100:-1}" == "1" ]] && ! printf '%s\n' "${GPU_NAMES}" | grep -q 'H100'; then
+  echo "Expected H100 GPUs; refusing to run on a different GPU class" >&2
+  printf '%s\n' "${GPU_NAMES}" >&2
+  exit 3
+fi
+python3 - <<'PY'
+import torch
+
+if not torch.cuda.is_available() or torch.cuda.device_count() != 8:
+    raise SystemExit("PyTorch must expose 8 CUDA devices for this validation")
+PY
+for required_path in "${MODEL_ROOT}" "${TORCH_DIST_ROOT}" "${PROMPT_DATA}" "${MEGATRON_ROOT}"; do
+  if [[ ! -e "${required_path}" ]]; then
+    echo "Required runtime path does not exist: ${required_path}" >&2
+    exit 3
+  fi
+done
+python3 - <<'PY'
+from rl_engine.integrations.vime.logp import provider
+print(f"RL-Kernel provider import OK: {provider.__module__}.{provider.__name__}")
+PY
 
 CKPT_ARGS=(
   --hf-checkpoint "${MODEL_ROOT}"
@@ -93,8 +138,15 @@ MISC_ARGS=(
 
 ray stop --force || true
 ray start --head --node-ip-address "${MASTER_ADDR:-127.0.0.1}" \
-  --num-gpus "${ACTOR_GPUS}" --disable-usage-stats \
+  --num-gpus "${NUM_GPUS}" --disable-usage-stats \
   --dashboard-host=0.0.0.0 --dashboard-port="${RAY_DASHBOARD_PORT:-8265}"
+
+TRAIN_LAYOUT_ARGS=()
+if [[ "${COLOCATE}" == "1" ]]; then
+  TRAIN_LAYOUT_ARGS+=(--colocate)
+else
+  TRAIN_LAYOUT_ARGS+=(--megatron-to-hf-mode bridge)
+fi
 
 ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT:-8265}" \
   --working-dir "${VIME_ROOT}" \
@@ -103,7 +155,7 @@ ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT:-8265}" \
   --actor-num-nodes 1 \
   --actor-num-gpus-per-node "${ACTOR_GPUS}" \
   --rollout-num-gpus "${ROLLOUT_GPUS}" \
-  --colocate \
+  "${TRAIN_LAYOUT_ARGS[@]}" \
   "${MODEL_ARGS[@]}" \
   "${CKPT_ARGS[@]}" \
   "${ROLLOUT_ARGS[@]}" \
