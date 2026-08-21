@@ -66,6 +66,7 @@ Start by Use Case
    advanced/delta-weight-sync.md
    advanced/vllm-config.md
    advanced/megatron-config.md
+   advanced/selected-logprob-provider.md
    advanced/arch-support-beyond-megatron.md
 
 .. toctree::

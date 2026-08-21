@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import sys
 import types
@@ -319,6 +320,31 @@ def test_update_weight_delta_disabled(monkeypatch):
         )
         with pytest.raises(NotImplementedError, match="unverified on vime"):
             module._validate_update_weight_args(args)
+
+
+@pytest.mark.unit
+def test_selected_logprob_provider_arguments_registered(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+
+    class RouterArgs:
+        @staticmethod
+        def add_cli_args(parser, **_kwargs):
+            return parser
+
+    module.RouterArgs = RouterArgs
+    parser = argparse.ArgumentParser()
+    module.get_vime_extra_args_provider()(parser)
+    args = parser.parse_args(
+        [
+            "--selected-logprob-provider",
+            "rl_engine.integrations.vime.logp.provider",
+            "--selected-logprob-provider-mode",
+            "strict",
+        ]
+    )
+
+    assert args.selected_logprob_provider == "rl_engine.integrations.vime.logp.provider"
+    assert args.selected_logprob_provider_mode == "strict"
 
 
 if __name__ == "__main__":

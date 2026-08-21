@@ -31,6 +31,11 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
+from .selected_logprob_provider import (
+    ContextParallelLayout,
+    SelectedLogprobRequest,
+    compute_selected_logprobs,
+)
 
 ROLLOUT_TOP_P_TOKEN_KEYS = (
     "rollout_top_p_token_ids",
@@ -531,15 +536,30 @@ def get_log_probs_and_entropy(
             args.allgather_cp,
         )
 
-    # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
-    log_prob_full, entropy_full = calculate_log_probs_and_entropy(
-        logits,
-        full_tokens,
-        tp_group,
+    cp_world_size = mpu.get_context_parallel_world_size()
+    cp_layout = "single" if cp_world_size == 1 else "allgather" if args.allgather_cp else "zigzag"
+    request = SelectedLogprobRequest(
+        logits=logits,
+        target_ids=full_tokens,
+        tensor_parallel_group=tp_group,
+        context_parallel=ContextParallelLayout(
+            world_size=cp_world_size,
+            rank=mpu.get_context_parallel_rank(),
+            layout=cp_layout,
+        ),
         with_entropy=with_entropy,
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        metadata={"logits_are_temperature_scaled": True},
+    )
+    # The provider owns only selected-logprob math and its TP reduction. Vime
+    # retains target construction, CP layout ownership, response extraction,
+    # CP redistribution, and loss composition.
+    log_prob_full, entropy_full = compute_selected_logprobs(
+        args=args,
+        request=request,
+        native=calculate_log_probs_and_entropy,
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
