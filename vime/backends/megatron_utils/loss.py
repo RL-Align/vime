@@ -501,7 +501,8 @@ def get_log_probs_and_entropy(
     log-probabilities; entropy is always computed from the unmasked logits.
     """
     assert non_loss_data
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    if logits.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise TypeError(f"selected-logprob logits must use fp32, fp16, or bf16; got {logits.dtype}")
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
