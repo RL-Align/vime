@@ -142,15 +142,18 @@ def compute_selected_logprobs(
         return _native(request, native)
     try:
         result = provider(request)
-    except SelectedLogprobProviderUnavailable as exc:
+    except Exception as exc:
+        if not _is_provider_unavailable(exc):
+            raise
         if mode == "strict":
             raise RuntimeError(f"selected-logprob provider {path!r} is unavailable: {exc}") from exc
         logger.warning("Selected-logprob provider %s is unavailable; using native path: %s", path, exc)
         return _native(request, native)
 
-    _validate_result(result, request, strict=mode == "strict")
-    _log_provider_identity(result)
-    return result.selected_logprobs, result.entropy
+    normalized = _normalize_result(result)
+    _validate_result(normalized, request, strict=mode == "strict")
+    _log_provider_identity(normalized)
+    return normalized.selected_logprobs, normalized.entropy
 
 
 def _load_provider(path: str) -> SelectedLogprobProvider:
@@ -178,9 +181,53 @@ def _native(
     )
 
 
-def _validate_result(result: Any, request: SelectedLogprobRequest, *, strict: bool) -> None:
-    if not isinstance(result, SelectedLogprobResult):
-        raise TypeError("selected-logprob providers must return SelectedLogprobResult")
+def _is_provider_unavailable(exc: Exception) -> bool:
+    """Keep provider packages independent from Vime's exception class."""
+
+    return isinstance(exc, SelectedLogprobProviderUnavailable) or bool(
+        getattr(exc, "selected_logprob_provider_unavailable", False)
+    )
+
+
+def _normalize_result(result: Any) -> SelectedLogprobResult:
+    """Accept Vime's dataclass or a structural result from an external package."""
+
+    if isinstance(result, SelectedLogprobResult):
+        return result
+    if isinstance(result, Mapping):
+        values = result
+        get = values.__getitem__
+    else:
+        get = lambda name: getattr(result, name)
+    try:
+        provenance = get("provenance")
+    except (AttributeError, KeyError) as exc:
+        raise TypeError(
+            "selected-logprob providers must return selected_logprobs, entropy, backend_id, "
+            "contract_id, and provenance"
+        ) from exc
+    try:
+        selected_logprobs = get("selected_logprobs")
+        entropy = get("entropy")
+        backend_id = get("backend_id")
+        contract_id = get("contract_id")
+    except (AttributeError, KeyError) as exc:
+        raise TypeError(
+            "selected-logprob providers must return selected_logprobs, entropy, backend_id, "
+            "contract_id, and provenance"
+        ) from exc
+    if not isinstance(provenance, Mapping):
+        raise TypeError("selected-logprob provider provenance must be a mapping")
+    return SelectedLogprobResult(
+        selected_logprobs=selected_logprobs,
+        entropy=entropy,
+        backend_id=backend_id,
+        contract_id=contract_id,
+        provenance=provenance,
+    )
+
+
+def _validate_result(result: SelectedLogprobResult, request: SelectedLogprobRequest, *, strict: bool) -> None:
     if result.selected_logprobs.shape != (request.logits.size(0), 1):
         raise ValueError(
             "selected-logprob provider returned invalid selected_logprobs shape "

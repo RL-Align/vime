@@ -551,7 +551,13 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
-        metadata={"logits_are_temperature_scaled": True},
+        metadata={
+            "logits_are_temperature_scaled": True,
+            "real_vocab_size": getattr(args, "vocab_size", None),
+            "padded_vocab_size": getattr(args, "padded_vocab_size", None),
+            "tp_rank": mpu.get_tensor_model_parallel_rank(),
+            "tp_world_size": mpu.get_tensor_model_parallel_world_size(),
+        },
     )
     # The provider owns only selected-logprob math and its TP reduction. Vime
     # retains target construction, CP layout ownership, response extraction,

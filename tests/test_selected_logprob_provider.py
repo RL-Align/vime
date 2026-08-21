@@ -81,6 +81,29 @@ def test_provider_receives_normalized_request_and_returns_result(monkeypatch):
     torch.testing.assert_close(entropy, request.logits.sum(dim=-1))
 
 
+def test_provider_may_return_a_structural_result_from_an_external_package(monkeypatch):
+    request = _request()
+
+    def provider(actual_request):
+        return SimpleNamespace(
+            selected_logprobs=actual_request.logits[:, :1],
+            entropy=None,
+            backend_id="external.structural",
+            contract_id="external.structural.v1",
+            provenance={"tp_reduction": "provider_owned"},
+        )
+
+    path = _install_provider(monkeypatch, provider)
+    actual, entropy = compute_selected_logprobs(
+        args=SimpleNamespace(selected_logprob_provider=path, selected_logprob_provider_mode="strict"),
+        request=request,
+        native=_native,
+    )
+
+    assert entropy is None
+    torch.testing.assert_close(actual, request.logits[:, :1])
+
+
 def test_auto_mode_only_falls_back_for_explicit_unavailability(monkeypatch):
     request = _request()
     calls = {"native": 0}
