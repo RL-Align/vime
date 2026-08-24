@@ -36,7 +36,13 @@ from .cp_utils import prepare_routed_experts_for_routing_replay, slice_log_prob_
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data
 from .hf_checkpoint_saver import save_hf_model_to_path
 from .initialize import init, is_megatron_main_rank
-from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
+from .loss import (
+    compute_advantages_and_returns,
+    drain_captured_log_probs,
+    enable_log_prob_capture,
+    get_log_probs_and_entropy,
+    get_values,
+)
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_disk import UpdateWeightFromDisk
@@ -504,20 +510,37 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
-            with timer("actor_train"):
-                train(
-                    rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
-                    global_batch_sizes,
-                )
+            capture_log_probs = self.args.save_debug_train_data is not None and "log_probs" not in rollout_data
+            if capture_log_probs:
+                enable_log_prob_capture()
+            try:
+                with timer("actor_train"):
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                        global_batch_sizes,
+                    )
+            finally:
+                if capture_log_probs:
+                    captured = drain_captured_log_probs()
+                    partition = rollout_data.get("partition")
+                    if captured and partition is not None and all(int(pos) in captured for pos in partition):
+                        rollout_data["log_probs"] = [captured[int(pos)] for pos in partition]
+                if self.args.save_debug_train_data is not None:
+                    train_dump_utils.save_debug_train_data(
+                        self.args,
+                        rollout_id=rollout_id,
+                        rollout_data=rollout_data,
+                    )
 
             self.prof.step(rollout_id=rollout_id)
 
-        train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+        if self.args.save_debug_train_data is None:
+            train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()

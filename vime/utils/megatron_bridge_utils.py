@@ -5,6 +5,15 @@ try:
 except ImportError:
     unwrap_model = None
 
+# Megatron Bridge newer releases do not classify the vocab output wrapper used
+# by Vime; register its column-parallel semantics for HF export.
+try:
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+
+    AutoMapping.register_module_type("LinearCrossEntropyModule", "column")
+except (ImportError, AttributeError):
+    pass
+
 
 def patch_hf_config_for_megatron_bridge(hf_config):
     configs = []

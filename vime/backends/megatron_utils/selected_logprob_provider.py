@@ -64,6 +64,13 @@ class SelectedLogprobRequest:
     chunk_size: int
     log_prob_keep_mask: torch.Tensor | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    hidden: torch.Tensor | None = None
+    lm_head_weight: torch.Tensor | None = None
+    lm_head_bias: torch.Tensor | None = None
+    vocab_start_index: int = 0
+    global_vocab_size: int | None = None
+    real_vocab_size: int | None = None
+    temperature: float | torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.logits.ndim != 2:
@@ -79,6 +86,45 @@ class SelectedLogprobRequest:
             raise TypeError("selected-logprob target_ids must use an integer dtype")
         if self.log_prob_keep_mask is not None and self.log_prob_keep_mask.shape != self.logits.shape:
             raise ValueError("selected-logprob log_prob_keep_mask must match logits shape")
+        structural = (self.hidden, self.lm_head_weight, self.lm_head_bias)
+        if self.hidden is not None or self.lm_head_weight is not None:
+            if not isinstance(self.hidden, torch.Tensor):
+                raise ValueError("linear_logp request.hidden must be a torch.Tensor")
+            if not isinstance(self.lm_head_weight, torch.Tensor):
+                raise ValueError("linear_logp request.lm_head_weight must be a torch.Tensor")
+            if self.hidden.ndim != 2:
+                raise ValueError("linear_logp request.hidden must be [T, hidden]")
+            if self.lm_head_weight.ndim != 2:
+                raise ValueError("linear_logp request.lm_head_weight must be [V_local, hidden]")
+            if self.hidden.size(0) != self.logits.size(0):
+                raise ValueError("linear_logp hidden rows must match local logits rows")
+            if self.hidden.size(1) != self.lm_head_weight.size(1):
+                raise ValueError("linear_logp hidden width must match LM-head width")
+            if self.hidden.device != self.logits.device or self.lm_head_weight.device != self.logits.device:
+                raise ValueError("linear_logp tensors must share the logits device")
+            if self.lm_head_bias is not None:
+                if not isinstance(self.lm_head_bias, torch.Tensor):
+                    raise ValueError("linear_logp request.lm_head_bias must be a torch.Tensor")
+                if self.lm_head_bias.ndim != 1 or self.lm_head_bias.size(0) != self.lm_head_weight.size(0):
+                    raise ValueError("linear_logp LM-head bias must match local vocab width")
+                if self.lm_head_bias.device != self.logits.device:
+                    raise ValueError("linear_logp LM-head bias must share the logits device")
+            for name, value in (
+                ("global_vocab_size", self.global_vocab_size),
+                ("real_vocab_size", self.real_vocab_size),
+            ):
+                if value is not None and (isinstance(value, bool) or int(value) <= 0):
+                    raise ValueError(f"linear_logp {name} must be positive")
+            if self.temperature is not None:
+                if isinstance(self.temperature, torch.Tensor):
+                    if self.temperature.numel() not in (1, self.logits.size(0)):
+                        raise ValueError("linear_logp temperature must be scalar or [T]")
+                    if bool((self.temperature <= 0).any().item()):
+                        raise ValueError("linear_logp temperature must be positive")
+                elif float(self.temperature) <= 0:
+                    raise ValueError("linear_logp temperature must be positive")
+        elif any(value is not None for value in structural):
+            raise ValueError("linear_logp structural request fields must be supplied together")
 
 
 @dataclass(frozen=True)
@@ -195,10 +241,15 @@ def _normalize_result(result: Any) -> SelectedLogprobResult:
     if isinstance(result, SelectedLogprobResult):
         return result
     if isinstance(result, Mapping):
-        values = result
-        get = values.__getitem__
+
+        def get(name):
+            return result[name]
+
     else:
-        get = lambda name: getattr(result, name)
+
+        def get(name):
+            return getattr(result, name)
+
     try:
         provenance = get("provenance")
     except (AttributeError, KeyError) as exc:

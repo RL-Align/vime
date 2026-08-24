@@ -14,6 +14,7 @@ if [[ ! -f "${RL_KERNEL_ROOT}/rl_engine/integrations/vime/logp.py" ]]; then
 fi
 
 export PYTHONUNBUFFERED=1
+export VIME_RL_KERNEL_STRICT="${VIME_RL_KERNEL_STRICT:-1}"
 MEGATRON_ROOT="${MEGATRON_ROOT:-/root/Megatron-LM}"
 export PYTHONPATH="${RL_KERNEL_ROOT}:${VIME_ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
 
@@ -125,6 +126,7 @@ PARALLEL_ARGS=(
 RL_KERNEL_ARGS=(
   --selected-logprob-provider rl_engine.integrations.vime.logp.provider
   --selected-logprob-provider-mode strict
+  --custom-megatron-init-path rl_engine.integrations.megatron_runtime.initialize_from_environment
 )
 
 MISC_ARGS=(
@@ -132,6 +134,7 @@ MISC_ARGS=(
   --hidden-dropout 0.0
   --attention-softmax-in-fp32
   --attention-backend flash
+  --no-gradient-accumulation-fusion
   --rollout-num-gpus-per-engine "${ROLLOUT_GPUS_PER_ENGINE}"
   --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.4}"
 )

@@ -1,6 +1,6 @@
 import warnings
 from argparse import Namespace
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
 import torch
@@ -31,16 +31,37 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
-from .selected_logprob_provider import (
-    ContextParallelLayout,
-    SelectedLogprobRequest,
-    compute_selected_logprobs,
-)
+from .selected_logprob_provider import ContextParallelLayout, SelectedLogprobRequest, compute_selected_logprobs
 
 ROLLOUT_TOP_P_TOKEN_KEYS = (
     "rollout_top_p_token_ids",
     "rollout_top_p_token_offsets",
 )
+
+
+_LOG_PROB_CAPTURE: dict[int, torch.Tensor] | None = None
+
+
+def enable_log_prob_capture() -> None:
+    global _LOG_PROB_CAPTURE
+    _LOG_PROB_CAPTURE = {}
+
+
+def drain_captured_log_probs() -> dict[int, torch.Tensor]:
+    global _LOG_PROB_CAPTURE
+    captured = _LOG_PROB_CAPTURE or {}
+    _LOG_PROB_CAPTURE = None
+    return captured
+
+
+def _maybe_capture_log_probs(batch: RolloutBatch, log_probs: list[torch.Tensor]) -> None:
+    if _LOG_PROB_CAPTURE is None:
+        return
+    positions = batch.get("partition")
+    if not positions:
+        return
+    for position, log_prob in zip(positions, log_probs, strict=True):
+        _LOG_PROB_CAPTURE.setdefault(int(position), log_prob.detach().clone())
 
 
 def get_rollout_top_p_logprob_kwargs(args: Namespace, batch: dict[str, Any]) -> dict[str, Any]:
@@ -490,6 +511,7 @@ def get_log_probs_and_entropy(
     non_loss_data: bool = True,
     top_p_token_ids: list[list[int]] | None = None,
     top_p_token_offsets: list[list[int]] | None = None,
+    linear_logp_context: Mapping[str, Any] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
@@ -552,6 +574,21 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        hidden=None if linear_logp_context is None else linear_logp_context.get("hidden"),
+        lm_head_weight=None if linear_logp_context is None else linear_logp_context.get("lm_head_weight"),
+        lm_head_bias=None if linear_logp_context is None else linear_logp_context.get("lm_head_bias"),
+        vocab_start_index=0 if linear_logp_context is None else int(linear_logp_context.get("vocab_start_index", 0)),
+        global_vocab_size=(
+            getattr(args, "padded_vocab_size", None)
+            if linear_logp_context is None
+            else linear_logp_context.get("global_vocab_size", getattr(args, "padded_vocab_size", None))
+        ),
+        real_vocab_size=(
+            getattr(args, "vocab_size", None)
+            if linear_logp_context is None
+            else linear_logp_context.get("real_vocab_size", getattr(args, "vocab_size", None))
+        ),
+        temperature=rollout_temperature,
         metadata={
             "logits_are_temperature_scaled": True,
             "real_vocab_size": getattr(args, "vocab_size", None),
@@ -917,6 +954,7 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    linear_logp_context: Mapping[str, Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO) and metrics.
 
@@ -955,10 +993,12 @@ def policy_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=True,
+        linear_logp_context=linear_logp_context,
         **get_rollout_top_p_logprob_kwargs(args, batch),
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    _maybe_capture_log_probs(batch, log_probs)
     if not args.use_rollout_logprobs and not old_log_probs:
         old_log_probs = [log_prob.detach() for log_prob in log_probs]
     train_log_probs_for_tis = batch.get("log_probs")
@@ -1105,10 +1145,17 @@ def policy_loss_function(
         loss += 0 * logits.sum()
 
     train_rollout_logprob_abs_diff = None
+    train_rollout_logprob_debug = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         log_probs_to_compare = log_probs if args.use_rollout_logprobs else old_log_probs
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((log_probs_to_compare - rollout_log_probs).abs())
+        logprob_abs_diff = (log_probs_to_compare - rollout_log_probs).abs()
+        train_rollout_logprob_abs_diff = sum_of_sample_mean(logprob_abs_diff)
+        train_rollout_logprob_debug = {
+            "mismatch_count": torch.ne(log_probs_to_compare, rollout_log_probs).sum().to(torch.float32),
+            "max_abs_diff": logprob_abs_diff.max() if logprob_abs_diff.numel() else logprob_abs_diff.new_tensor(0.0),
+            "numel": logprob_abs_diff.new_tensor(float(logprob_abs_diff.numel())),
+        }
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -1120,6 +1167,14 @@ def policy_loss_function(
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
+        assert train_rollout_logprob_debug is not None
+        reported_loss["train_current_rollout_logprob_mismatch_count"] = (
+            train_rollout_logprob_debug["mismatch_count"].clone().detach()
+        )
+        reported_loss["train_current_rollout_logprob_max_abs_diff"] = (
+            train_rollout_logprob_debug["max_abs_diff"].clone().detach()
+        )
+        reported_loss["train_current_rollout_logprob_numel"] = train_rollout_logprob_debug["numel"].clone().detach()
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
@@ -1149,6 +1204,7 @@ def value_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    linear_logp_context: Mapping[str, Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute clipped value loss and metrics.
 
@@ -1206,6 +1262,7 @@ def sft_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    linear_logp_context: Mapping[str, Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute supervised fine-tuning loss over response tokens.
 
@@ -1233,6 +1290,7 @@ def sft_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=False,
+        linear_logp_context=linear_logp_context,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1257,6 +1315,7 @@ def loss_function(
     num_microbatches: int,
     step_global_batch_size: int,
     logits: torch.Tensor,
+    linear_logp_context: Mapping[str, Any] | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -1308,9 +1367,29 @@ def loss_function(
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
     if args.recompute_loss_function:
-        loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean, use_reentrant=False)
+        if args.loss_type in {"policy_loss", "sft_loss"}:
+            loss, log = checkpoint(
+                func,
+                args,
+                batch,
+                logits,
+                sum_of_sample_mean,
+                linear_logp_context=linear_logp_context,
+                use_reentrant=False,
+            )
+        else:
+            loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean, use_reentrant=False)
     else:
-        loss, log = func(args, batch, logits, sum_of_sample_mean)
+        if args.loss_type in {"policy_loss", "sft_loss"}:
+            loss, log = func(
+                args,
+                batch,
+                logits,
+                sum_of_sample_mean,
+                linear_logp_context=linear_logp_context,
+            )
+        else:
+            loss, log = func(args, batch, logits, sum_of_sample_mean)
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding). Without this, gradient doesn't flow through their attention path, so
