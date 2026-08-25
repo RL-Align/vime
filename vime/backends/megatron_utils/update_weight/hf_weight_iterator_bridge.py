@@ -59,7 +59,12 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             named_weights = self._bridge.export_hf_weights(self.model, cpu=False, conversion_tasks=conversion_tasks)
 
             def _streaming_quantized():
-                for hf_param_name, weight, megatron_param_name in named_weights:
+                for item in named_weights:
+                    if len(item) == 3:
+                        hf_param_name, weight, megatron_param_name = item
+                    else:
+                        hf_param_name, weight = item
+                        megatron_param_name = hf_param_name
                     processed_weight = postprocess_hf_param(
                         args=self.args,
                         megatron_param_name=megatron_param_name,

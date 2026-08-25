@@ -10,7 +10,11 @@ from urllib.parse import quote
 
 import cloudpickle
 import requests
-from vllm.utils.system_utils import kill_process_tree
+
+try:
+    from vllm.utils.system_utils import kill_process_tree
+except ImportError:  # vLLM < 0.10 exported this helper directly.
+    from vllm.utils import kill_process_tree
 
 from vime.backends.vllm_utils.external import get_server_info
 from vime.ray.ray_actor import RayActor
@@ -89,7 +93,11 @@ def _run_vllm_server(kwargs: dict, env: dict) -> None:
 
     from vllm.entrypoints.cli.serve import ServeSubcommand
     from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    try:
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+    except ImportError:  # vLLM < 0.10
+        from vllm.utils import FlexibleArgumentParser
 
     ns = argparse.Namespace(**kwargs)
     parser = make_arg_parser(FlexibleArgumentParser())
@@ -358,13 +366,23 @@ class VLLMEngine(RayActor):
         return self._make_request("init_weight_transfer_engine", payload)
 
     def start_weight_update(self, is_checkpoint_format: bool = False) -> dict:
-        return self._make_request("start_weight_update", {"is_checkpoint_format": is_checkpoint_format})
+        try:
+            return self._make_request("start_weight_update", {"is_checkpoint_format": is_checkpoint_format})
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return {"ok": True, "compat_noop": True}
+            raise
 
     def start_draft_weight_update(self) -> dict:
         return self._make_request("start_draft_weight_update", {})
 
     def finish_weight_update(self) -> dict:
-        return self._make_request("finish_weight_update", {})
+        try:
+            return self._make_request("finish_weight_update", {})
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return {"ok": True, "compat_noop": True}
+            raise
 
     def pull_weights(self, target_version: int):
         return self._make_request(
@@ -674,7 +692,19 @@ def _compute_server_args(
 def _vllm_server_field_names() -> frozenset[str]:
     """Return the vLLM fields accepted by CLI generation and config overrides."""
     from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.entrypoints.openai.cli_args import FrontendArgs
+
+    try:
+        from vllm.entrypoints.openai.cli_args import FrontendArgs
+    except ImportError:
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
+
+        try:
+            from vllm.utils.argparse_utils import FlexibleArgumentParser
+        except ImportError:  # vLLM < 0.10
+            from vllm.utils import FlexibleArgumentParser
+
+        parser = make_arg_parser(FlexibleArgumentParser(add_help=False))
+        return frozenset(action.dest for action in parser._actions if action.dest != argparse.SUPPRESS)
 
     return frozenset(f.name for f in (*dataclasses.fields(AsyncEngineArgs), *dataclasses.fields(FrontendArgs)))
 
