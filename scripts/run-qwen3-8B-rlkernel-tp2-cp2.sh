@@ -7,16 +7,73 @@ set -euo pipefail
 
 VIME_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 RL_KERNEL_ROOT="${RL_KERNEL_ROOT:-${VIME_ROOT}/../RL-Kernel}"
+RL_KERNEL_MODE="${RL_KERNEL_MODE:-strict}"
+RL_KERNEL_ALIGNED="${RL_KERNEL_ALIGNED:-1}"
 
-if [[ ! -f "${RL_KERNEL_ROOT}/rl_engine/integrations/vime/logp.py" ]]; then
-  echo "RL_KERNEL_ROOT must point to an RL-Kernel checkout containing the Vime provider" >&2
+case "${RL_KERNEL_MODE}" in
+  strict|audit)
+    RL_KERNEL_CASE=R/R
+    SELECTED_LOGPROB_PROVIDER_MODE=strict
+    ;;
+  auto)
+    RL_KERNEL_CASE=P/P
+    SELECTED_LOGPROB_PROVIDER_MODE=auto
+    ;;
+  off)
+    RL_KERNEL_CASE=P/P
+    SELECTED_LOGPROB_PROVIDER_MODE=
+    ;;
+  *)
+    echo "RL_KERNEL_MODE must be strict, audit, auto, or off" >&2
+    exit 2
+    ;;
+esac
+if [[ "${RL_KERNEL_ALIGNED}" != "0" && "${RL_KERNEL_ALIGNED}" != "1" ]]; then
+  echo "RL_KERNEL_ALIGNED must be 0 or 1" >&2
   exit 2
 fi
 
+export RL_KERNEL_MODE
+if [[ "${RL_KERNEL_MODE}" != off ]]; then
+  if [[ ! -f "${RL_KERNEL_ROOT}/rl_engine/integrations/vime/linear_logp.py" ]]; then
+    echo "RL_KERNEL_ROOT must contain the RL-Kernel Vime linear_logp provider" >&2
+    exit 2
+  fi
+  export RL_KERNEL_ATTENTION_CASE="${RL_KERNEL_CASE}"
+  export RL_KERNEL_FFN_CASE="${RL_KERNEL_CASE}"
+  export RL_KERNEL_LOGP_CASE="${RL_KERNEL_CASE}"
+  export RL_KERNEL_VLLM_INTEGRATION=1
+  export RL_KERNEL_CUDA_ONLY=1
+  export VIME_RL_KERNEL_STRICT=0
+  if [[ "${RL_KERNEL_MODE}" == strict || "${RL_KERNEL_MODE}" == audit ]]; then
+    export VIME_RL_KERNEL_STRICT=1
+  fi
+  if [[ "${RL_KERNEL_MODE}" == audit ]]; then
+    export RL_KERNEL_ROUTE_REPORT_ALL_RANKS=1
+  fi
+else
+  unset RL_KERNEL_VLLM_INTEGRATION VIME_RL_KERNEL_STRICT
+  unset RL_KERNEL_DET_GEMM_SM90_ONLY RL_KERNEL_CUDA_ONLY
+  unset RL_KERNEL_ATTENTION_CASE RL_KERNEL_FFN_CASE RL_KERNEL_LOGP_CASE
+fi
+
 export PYTHONUNBUFFERED=1
-export VIME_RL_KERNEL_STRICT="${VIME_RL_KERNEL_STRICT:-1}"
 MEGATRON_ROOT="${MEGATRON_ROOT:-/root/Megatron-LM}"
-export PYTHONPATH="${RL_KERNEL_ROOT}:${VIME_ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
+if [[ "${RL_KERNEL_MODE}" == off ]]; then
+  export PYTHONPATH="${VIME_ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
+else
+  export PYTHONPATH="${RL_KERNEL_ROOT}:${VIME_ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
+fi
+if [[ "${RL_KERNEL_ALIGNED}" == 1 ]]; then
+  unset RL_KERNEL_DET_GEMM_SM90_ONLY
+  export VLLM_BATCH_INVARIANT=1
+  export NCCL_ALGO=Ring
+  export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
+  export CUBLAS_WORKSPACE_CONFIG=:16:8
+  export CUBLASLT_WORKSPACE_SIZE=1
+elif [[ "${RL_KERNEL_MODE}" != off ]]; then
+  export RL_KERNEL_DET_GEMM_SM90_ONLY=1
+fi
 
 # The provider is a vocab-parallel TP implementation.  CP owns token rows and
 # must not be used as a vocabulary reduction group.
@@ -42,7 +99,9 @@ if [[ "${TP_SIZE}" != "2" || "${CP_SIZE}" != "2" ]]; then
   echo "This validation entry point is intentionally fixed to TP=2, CP=2" >&2
   exit 2
 fi
-if [[ "${ROLLOUT_TOP_P}" != "1.0" ]]; then
+if [[ "${RL_KERNEL_MODE}" != off \
+  && "${RL_KERNEL_MODE}" != auto \
+  && "${ROLLOUT_TOP_P}" != "1.0" ]]; then
   echo "RL-Kernel strict selected-logprob validation requires ROLLOUT_TOP_P=1.0" >&2
   exit 2
 fi
@@ -82,10 +141,12 @@ for required_path in "${MODEL_ROOT}" "${TORCH_DIST_ROOT}" "${PROMPT_DATA}" "${ME
     exit 3
   fi
 done
-python3 - <<'PY'
-from rl_engine.integrations.vime.logp import provider
+if [[ "${RL_KERNEL_MODE}" != off ]]; then
+  python3 - <<'PY'
+from rl_engine.integrations.vime.linear_logp import provider
 print(f"RL-Kernel provider import OK: {provider.__module__}.{provider.__name__}")
 PY
+fi
 
 CKPT_ARGS=(
   --hf-checkpoint "${MODEL_ROOT}"
@@ -123,11 +184,14 @@ PARALLEL_ARGS=(
   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-2048}"
 )
 
-RL_KERNEL_ARGS=(
-  --selected-logprob-provider rl_engine.integrations.vime.logp.provider
-  --selected-logprob-provider-mode strict
-  --custom-megatron-init-path rl_engine.integrations.megatron_runtime.initialize_from_environment
-)
+RL_KERNEL_ARGS=()
+if [[ "${RL_KERNEL_MODE}" != off ]]; then
+  RL_KERNEL_ARGS=(
+    --selected-logprob-provider rl_engine.integrations.vime.linear_logp.provider
+    --selected-logprob-provider-mode "${SELECTED_LOGPROB_PROVIDER_MODE}"
+    --custom-megatron-init-path rl_engine.integrations.megatron_runtime.initialize_from_environment
+  )
+fi
 
 MISC_ARGS=(
   --attention-dropout 0.0
@@ -138,6 +202,17 @@ MISC_ARGS=(
   --rollout-num-gpus-per-engine "${ROLLOUT_GPUS_PER_ENGINE}"
   --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.4}"
 )
+if [[ "${RL_KERNEL_ALIGNED}" == 1 ]]; then
+  MISC_ARGS+=(
+    --seed 1234
+    --rollout-seed 42
+    --vllm-enable-deterministic-inference
+    --vllm-attention-backend flash_attn
+    --vllm-disable-custom-all-reduce
+    --deterministic-mode
+    --accumulate-allreduce-grads-in-fp32
+  )
+fi
 
 ray stop --force || true
 ray start --head --node-ip-address "${MASTER_ADDR:-127.0.0.1}" \
