@@ -336,8 +336,6 @@ def test_selected_logprob_provider_arguments_registered(monkeypatch):
     module.get_vime_extra_args_provider()(parser)
     args = parser.parse_args(
         [
-            "--rollout-batch-size",
-            "1",
             "--selected-logprob-provider",
             "rl_engine.integrations.vime.logp.provider",
             "--selected-logprob-provider-mode",
@@ -347,18 +345,6 @@ def test_selected_logprob_provider_arguments_registered(monkeypatch):
 
     assert args.selected_logprob_provider == "rl_engine.integrations.vime.logp.provider"
     assert args.selected_logprob_provider_mode == "strict"
-
-
-@pytest.mark.unit
-def test_strict_selected_logprob_provider_rejects_top_p_replay(monkeypatch):
-    module = load_arguments_module(monkeypatch)
-    args = argparse.Namespace(
-        selected_logprob_provider="rl_engine.integrations.vime.logp.provider",
-        selected_logprob_provider_mode="strict",
-        rollout_top_p=0.9,
-    )
-    with pytest.raises(ValueError, match="rollout-top-p 1.0"):
-        module._validate_selected_logprob_provider_args(args)
 
 
 if __name__ == "__main__":

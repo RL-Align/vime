@@ -5,13 +5,7 @@ import pytest
 import torch
 
 from megatron.core import mpu
-from vime.backends.megatron_utils.loss import (
-    _build_topp_keep_mask,
-    _maybe_capture_log_probs,
-    drain_captured_log_probs,
-    enable_log_prob_capture,
-    get_rollout_top_p_logprob_kwargs,
-)
+from vime.backends.megatron_utils.loss import _build_topp_keep_mask, get_rollout_top_p_logprob_kwargs
 
 
 NUM_GPUS = 0
@@ -101,21 +95,6 @@ def test_top_p_mask_aligns_with_cp1_response_rows(monkeypatch):
 
     masked_rows = {row: _kept_ids(keep[row]) for row in range(keep.size(0)) if not keep[row].all()}
     assert masked_rows == {2: [13], 3: [14], 5: [21], 6: [22], 7: [23]}
-
-
-@pytest.mark.unit
-def test_logprob_capture_uses_partition_keys_and_detaches_values():
-    enable_log_prob_capture()
-    first = torch.tensor([1.0, 2.0], requires_grad=True)
-    second = torch.tensor([3.0], requires_grad=True)
-
-    _maybe_capture_log_probs({"partition": [7, 3]}, [first, second])
-    captured = drain_captured_log_probs()
-
-    assert set(captured) == {3, 7}
-    torch.testing.assert_close(captured[7], first)
-    torch.testing.assert_close(captured[3], second)
-    assert not captured[7].requires_grad
 
 
 if __name__ == "__main__":

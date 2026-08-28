@@ -1517,11 +1517,6 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
             )
             parser.add_argument(
-                "--ci-train-rollout-logprob-abs-diff-threshold",
-                type=float,
-                default=0.1,
-            )
-            parser.add_argument(
                 "--ci-save-grad-norm",
                 type=str,
                 default=None,

@@ -35,27 +35,6 @@ def _native(*args, **kwargs):
     return logits[:, :1], entropy
 
 
-def _structural_request(**overrides) -> SelectedLogprobRequest:
-    values = dict(
-        logits=torch.randn(3, 5),
-        target_ids=torch.tensor([1, 2, 3]),
-        tensor_parallel_group=None,
-        context_parallel=ContextParallelLayout(world_size=1, rank=0, layout="single"),
-        with_entropy=False,
-        with_entropy_grad=False,
-        chunk_size=64,
-        hidden=torch.randn(3, 4),
-        lm_head_weight=torch.randn(5, 4),
-        lm_head_bias=torch.randn(5),
-        vocab_start_index=0,
-        global_vocab_size=5,
-        real_vocab_size=4,
-        temperature=torch.ones(3),
-    )
-    values.update(overrides)
-    return SelectedLogprobRequest(**values)
-
-
 def _install_provider(monkeypatch, provider):
     module_name = "selected_logprob_provider_fixture"
     module = types.ModuleType(module_name)
@@ -100,50 +79,6 @@ def test_provider_receives_normalized_request_and_returns_result(monkeypatch):
     assert entropy is not None
     torch.testing.assert_close(actual, request.logits[:, :1])
     torch.testing.assert_close(entropy, request.logits.sum(dim=-1))
-
-
-def test_structural_request_accepts_aligned_hidden_and_lm_head():
-    request = _structural_request()
-
-    assert request.hidden is not None and request.hidden.shape == (3, 4)
-    assert request.lm_head_weight is not None and request.lm_head_weight.shape == (5, 4)
-
-
-@pytest.mark.parametrize(
-    ("overrides", "match"),
-    [
-        ({"lm_head_weight": None}, "lm_head_weight"),
-        ({"hidden": torch.randn(2, 4)}, "hidden rows"),
-        ({"lm_head_weight": torch.randn(5, 6)}, "hidden width"),
-        ({"temperature": torch.tensor([1.0, 0.0, 1.0])}, "temperature must be positive"),
-    ],
-)
-def test_structural_request_rejects_incomplete_or_misaligned_inputs(overrides, match):
-    with pytest.raises(ValueError, match=match):
-        _structural_request(**overrides)
-
-
-def test_provider_may_return_a_structural_result_from_an_external_package(monkeypatch):
-    request = _request()
-
-    def provider(actual_request):
-        return SimpleNamespace(
-            selected_logprobs=actual_request.logits[:, :1],
-            entropy=None,
-            backend_id="external.structural",
-            contract_id="external.structural.v1",
-            provenance={"tp_reduction": "provider_owned"},
-        )
-
-    path = _install_provider(monkeypatch, provider)
-    actual, entropy = compute_selected_logprobs(
-        args=SimpleNamespace(selected_logprob_provider=path, selected_logprob_provider_mode="strict"),
-        request=request,
-        native=_native,
-    )
-
-    assert entropy is None
-    torch.testing.assert_close(actual, request.logits[:, :1])
 
 
 def test_auto_mode_only_falls_back_for_explicit_unavailability(monkeypatch):

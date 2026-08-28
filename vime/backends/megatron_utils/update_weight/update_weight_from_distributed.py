@@ -15,14 +15,7 @@ from megatron.core import mpu
 from ray import ObjectRef
 from ray.actor import ActorHandle
 from tqdm import tqdm
-
-try:
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-
-    NCCLTrainerSendWeightsArgs = None
-except ImportError:  # Colocated IPC runs do not need the distributed transfer backend.
-    NCCLTrainerSendWeightsArgs = None
-    NCCLWeightTransferEngine = None
+from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
 
 from vime.utils.distributed_utils import get_gloo_group
 
@@ -506,12 +499,6 @@ def update_weights_from_distributed(
     The *group* is a vLLM ``PyNcclCommunicator`` from ``trainer_init``
     in the Megatron trainer process.
     """
-    if NCCLWeightTransferEngine is None:
-        raise RuntimeError(
-            "This vLLM build does not provide the NCCL weight-transfer API; "
-            "use colocated IPC weight transfer or install a vLLM build with that API."
-        )
-
     refs = [
         engine.update_weights_from_distributed.remote(
             names=[name for name, _ in converted_named_tensors],
@@ -526,13 +513,10 @@ def update_weights_from_distributed(
         (name, (param.data if hasattr(param, "data") else param).contiguous())
         for name, param in converted_named_tensors
     )
-    if NCCLTrainerSendWeightsArgs is None:
-        NCCLWeightTransferEngine.trainer_send_weights(named_gpu_iter, group, packed=True)
-    else:
-        NCCLWeightTransferEngine.trainer_send_weights(
-            named_gpu_iter,
-            NCCLTrainerSendWeightsArgs(group=group, packed=True),
-        )
+    NCCLWeightTransferEngine.trainer_send_weights(
+        named_gpu_iter,
+        NCCLTrainerSendWeightsArgs(group=group, packed=True),
+    )
 
     return refs
 

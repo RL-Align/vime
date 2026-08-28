@@ -1,11 +1,7 @@
 import argparse
 
 from vllm.engine.arg_utils import AsyncEngineArgs
-
-try:
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
-except ImportError:  # vLLM < 0.10 exported this parser directly.
-    from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm_router.launch_router import RouterArgs
 
 from vime.utils.http_utils import _wrap_ipv6
@@ -87,10 +83,6 @@ def add_vllm_arguments(parser):
                     new_flags.append(s)
 
             new_kwargs = kwargs.copy()
-            # ``deprecated`` is vLLM parser metadata, not an argparse keyword
-            # before Python 3.13. Vime owns the renamed CLI surface, so dropping
-            # the upstream warning metadata preserves behavior on both parsers.
-            new_kwargs.pop("deprecated", None)
             if "dest" in new_kwargs and isinstance(new_kwargs["dest"], str):
                 if not new_kwargs["dest"].startswith("vllm_"):
                     new_kwargs["dest"] = f"vllm_{new_kwargs['dest']}"
@@ -106,15 +98,10 @@ def add_vllm_arguments(parser):
 
     parser.add_argument = _wrap_add_argument(old_add_argument)
     parser.add_argument_group = patched_add_argument_group
-    try:
-        from vllm.entrypoints.openai.cli_args import FrontendArgs
-    except ImportError:
-        from vllm.entrypoints.openai.cli_args import make_arg_parser
+    AsyncEngineArgs.add_cli_args(parser)
+    from vllm.entrypoints.openai.cli_args import FrontendArgs
 
-        make_arg_parser(parser)
-    else:
-        AsyncEngineArgs.add_cli_args(parser)
-        FrontendArgs.add_cli_args(parser)
+    FrontendArgs.add_cli_args(parser)
     parser.add_argument = old_add_argument
     parser.add_argument_group = old_add_argument_group
 
