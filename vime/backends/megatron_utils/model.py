@@ -35,6 +35,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
+from .linear_logp_provider import LinearLogpContext, LinearProjection, VocabPartition, linear_logp_provider_path
 from .model_provider import get_model_provider_func
 from .stateless_adam import StatelessAdam
 
@@ -95,15 +96,16 @@ def _install_linear_logp_capture(model_chunks: Sequence[DDP], args: Namespace) -
             bias = getattr(module, "bias", None)
             if bias is not None and (bias.ndim != 1 or bias.size(0) != weight.size(0)):
                 raise RuntimeError("strict linear_logp LM-head bias does not match padded shard")
-            owner._vime_linear_logp_context = {
-                "hidden": hidden_2d,
-                "lm_head_weight": weight,
-                "lm_head_bias": bias,
-                "tp_group": getattr(module, "tp_group", None),
-                "vocab_start_index": int(vocab_start),
-                "global_vocab_size": global_vocab,
-                "real_vocab_size": real_vocab,
-            }
+            owner._vime_linear_logp_context = LinearLogpContext(
+                hidden=hidden_2d,
+                projection=LinearProjection(weight=weight, bias=bias),
+                vocab_partition=VocabPartition(
+                    local_start=int(vocab_start),
+                    local_size=weight.size(0),
+                    real_size=real_vocab,
+                    padded_size=global_vocab,
+                ),
+            )
 
         handle = output_layer.register_forward_pre_hook(capture, with_kwargs=True)
         output_layer._vime_linear_logp_capture_handle = handle
@@ -367,7 +369,7 @@ def setup_model_and_optimizer(
     assert args.load is not None or args.pretrained_checkpoint is not None
 
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
-    if role == "actor":
+    if role == "actor" and linear_logp_provider_path(args) is not None:
         _install_linear_logp_capture(model, args)
 
     # Optimizer

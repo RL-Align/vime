@@ -69,35 +69,23 @@ def _is_moe_config(hf_config):
     )
 
 
-def _validate_selected_logprob_provider_args(args):
-    provider_path = str(getattr(args, "selected_logprob_provider", "") or "").strip()
-    provider_mode = str(getattr(args, "selected_logprob_provider_mode", "auto") or "auto").strip().lower()
+def _validate_linear_logp_provider_args(args):
+    provider_path = str(getattr(args, "linear_logp_provider", "") or "").strip()
+    provider_mode = str(getattr(args, "linear_logp_provider_mode", "auto") or "auto").strip().lower()
     if provider_mode == "strict" and not provider_path:
         raise ValueError(
-            "--selected-logprob-provider-mode strict requires --selected-logprob-provider; "
+            "--linear-logp-provider-mode strict requires --linear-logp-provider; "
             "otherwise Vime has no provider to enforce"
         )
     if provider_mode not in {"auto", "strict"}:
-        raise ValueError(
-            "selected_logprob_provider_mode must be 'auto' or 'strict', "
-            f"got {provider_mode!r}"
-        )
-    if (
-        provider_mode == "strict"
-        and provider_path == "rl_engine.integrations.vime.logp.provider"
-        and float(getattr(args, "rollout_top_p", 1.0)) != 1.0
-    ):
-        raise ValueError(
-            "the RL-Kernel selected-logprob provider currently requires --rollout-top-p 1.0; "
-            "top-p replay masks are not part of its validated contract"
-        )
+        raise ValueError("linear_logp_provider_mode must be 'auto' or 'strict', " f"got {provider_mode!r}")
 
 
 def validate_args(args):
     """Run megatron's own validate_args plus vime-specific megatron validations."""
 
     _megatron_validate_args(args)
-    _validate_selected_logprob_provider_args(args)
+    _validate_linear_logp_provider_args(args)
 
     # always use varlen
     args.variable_seq_lengths = True

@@ -323,7 +323,7 @@ def test_update_weight_delta_disabled(monkeypatch):
 
 
 @pytest.mark.unit
-def test_selected_logprob_provider_arguments_registered(monkeypatch):
+def test_linear_logp_provider_arguments_registered(monkeypatch):
     module = load_vime_arguments_module(monkeypatch)
 
     class RouterArgs:
@@ -338,27 +338,26 @@ def test_selected_logprob_provider_arguments_registered(monkeypatch):
         [
             "--rollout-batch-size",
             "1",
-            "--selected-logprob-provider",
-            "rl_engine.integrations.vime.logp.provider",
-            "--selected-logprob-provider-mode",
+            "--linear-logp-provider",
+            "rl_engine.integrations.vime.linear_logp_provider.provider",
+            "--linear-logp-provider-mode",
             "strict",
         ]
     )
 
-    assert args.selected_logprob_provider == "rl_engine.integrations.vime.logp.provider"
-    assert args.selected_logprob_provider_mode == "strict"
+    assert args.linear_logp_provider == "rl_engine.integrations.vime.linear_logp_provider.provider"
+    assert args.linear_logp_provider_mode == "strict"
 
 
 @pytest.mark.unit
-def test_strict_selected_logprob_provider_rejects_top_p_replay(monkeypatch):
+def test_strict_linear_logp_provider_validation_is_provider_agnostic(monkeypatch):
     module = load_arguments_module(monkeypatch)
     args = argparse.Namespace(
-        selected_logprob_provider="rl_engine.integrations.vime.logp.provider",
-        selected_logprob_provider_mode="strict",
+        linear_logp_provider="example.provider",
+        linear_logp_provider_mode="strict",
         rollout_top_p=0.9,
     )
-    with pytest.raises(ValueError, match="rollout-top-p 1.0"):
-        module._validate_selected_logprob_provider_args(args)
+    module._validate_linear_logp_provider_args(args)
 
 
 if __name__ == "__main__":

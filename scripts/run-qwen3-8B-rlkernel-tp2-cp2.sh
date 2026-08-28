@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Qwen3-8B GRPO smoke/validation run with the RL-Kernel selected-logprob
-# provider.  Vime remains the launcher; RL-Kernel owns the provider and its
+# Qwen3-8B GRPO smoke/validation run with the RL-Kernel linear_logp provider.
+# Vime remains the launcher; RL-Kernel owns the provider and its
 # contract.  This script intentionally keeps the framework-side change small.
 
 set -euo pipefail
@@ -13,15 +13,15 @@ RL_KERNEL_ALIGNED="${RL_KERNEL_ALIGNED:-1}"
 case "${RL_KERNEL_MODE}" in
   strict|audit)
     RL_KERNEL_CASE=R/R
-    SELECTED_LOGPROB_PROVIDER_MODE=strict
+    LINEAR_LOGP_PROVIDER_MODE=strict
     ;;
   auto)
     RL_KERNEL_CASE=P/P
-    SELECTED_LOGPROB_PROVIDER_MODE=auto
+    LINEAR_LOGP_PROVIDER_MODE=auto
     ;;
   off)
     RL_KERNEL_CASE=P/P
-    SELECTED_LOGPROB_PROVIDER_MODE=
+    LINEAR_LOGP_PROVIDER_MODE=
     ;;
   *)
     echo "RL_KERNEL_MODE must be strict, audit, auto, or off" >&2
@@ -35,7 +35,7 @@ fi
 
 export RL_KERNEL_MODE
 if [[ "${RL_KERNEL_MODE}" != off ]]; then
-  if [[ ! -f "${RL_KERNEL_ROOT}/rl_engine/integrations/vime/linear_logp.py" ]]; then
+  if [[ ! -f "${RL_KERNEL_ROOT}/rl_engine/integrations/vime/linear_logp_provider.py" ]]; then
     echo "RL_KERNEL_ROOT must contain the RL-Kernel Vime linear_logp provider" >&2
     exit 2
   fi
@@ -102,7 +102,7 @@ fi
 if [[ "${RL_KERNEL_MODE}" != off \
   && "${RL_KERNEL_MODE}" != auto \
   && "${ROLLOUT_TOP_P}" != "1.0" ]]; then
-  echo "RL-Kernel strict selected-logprob validation requires ROLLOUT_TOP_P=1.0" >&2
+  echo "RL-Kernel strict linear_logp validation requires ROLLOUT_TOP_P=1.0" >&2
   exit 2
 fi
 
@@ -143,7 +143,7 @@ for required_path in "${MODEL_ROOT}" "${TORCH_DIST_ROOT}" "${PROMPT_DATA}" "${ME
 done
 if [[ "${RL_KERNEL_MODE}" != off ]]; then
   python3 - <<'PY'
-from rl_engine.integrations.vime.linear_logp import provider
+from rl_engine.integrations.vime.linear_logp_provider import provider
 print(f"RL-Kernel provider import OK: {provider.__module__}.{provider.__name__}")
 PY
 fi
@@ -187,8 +187,8 @@ PARALLEL_ARGS=(
 RL_KERNEL_ARGS=()
 if [[ "${RL_KERNEL_MODE}" != off ]]; then
   RL_KERNEL_ARGS=(
-    --selected-logprob-provider rl_engine.integrations.vime.linear_logp.provider
-    --selected-logprob-provider-mode "${SELECTED_LOGPROB_PROVIDER_MODE}"
+    --linear-logp-provider rl_engine.integrations.vime.linear_logp_provider.provider
+    --linear-logp-provider-mode "${LINEAR_LOGP_PROVIDER_MODE}"
     --custom-megatron-init-path rl_engine.integrations.megatron_runtime.initialize_from_environment
   )
 fi
