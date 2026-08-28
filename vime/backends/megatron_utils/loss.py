@@ -31,7 +31,7 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
-from .selected_logprob_provider import ContextParallelLayout, SelectedLogprobRequest, compute_selected_logprobs
+from .linear_logp_provider import LinearLogpContext, LinearLogpRequest, TokenLayout, compute_linear_logp
 
 ROLLOUT_TOP_P_TOKEN_KEYS = (
     "rollout_top_p_token_ids",
@@ -511,7 +511,7 @@ def get_log_probs_and_entropy(
     non_loss_data: bool = True,
     top_p_token_ids: list[list[int]] | None = None,
     top_p_token_offsets: list[list[int]] | None = None,
-    linear_logp_context: Mapping[str, Any] | None = None,
+    linear_logp_context: LinearLogpContext | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
@@ -524,7 +524,7 @@ def get_log_probs_and_entropy(
     """
     assert non_loss_data
     if logits.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        raise TypeError(f"selected-logprob logits must use fp32, fp16, or bf16; got {logits.dtype}")
+        raise TypeError(f"linear_logp logits must use fp32, fp16, or bf16; got {logits.dtype}")
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
@@ -561,11 +561,11 @@ def get_log_probs_and_entropy(
 
     cp_world_size = mpu.get_context_parallel_world_size()
     cp_layout = "single" if cp_world_size == 1 else "allgather" if args.allgather_cp else "zigzag"
-    request = SelectedLogprobRequest(
+    request = LinearLogpRequest(
         logits=logits,
         target_ids=full_tokens,
         tensor_parallel_group=tp_group,
-        context_parallel=ContextParallelLayout(
+        token_layout=TokenLayout(
             world_size=cp_world_size,
             rank=mpu.get_context_parallel_rank(),
             layout=cp_layout,
@@ -574,20 +574,7 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
-        hidden=None if linear_logp_context is None else linear_logp_context.get("hidden"),
-        lm_head_weight=None if linear_logp_context is None else linear_logp_context.get("lm_head_weight"),
-        lm_head_bias=None if linear_logp_context is None else linear_logp_context.get("lm_head_bias"),
-        vocab_start_index=0 if linear_logp_context is None else int(linear_logp_context.get("vocab_start_index", 0)),
-        global_vocab_size=(
-            getattr(args, "padded_vocab_size", None)
-            if linear_logp_context is None
-            else linear_logp_context.get("global_vocab_size", getattr(args, "padded_vocab_size", None))
-        ),
-        real_vocab_size=(
-            getattr(args, "vocab_size", None)
-            if linear_logp_context is None
-            else linear_logp_context.get("real_vocab_size", getattr(args, "vocab_size", None))
-        ),
+        context=linear_logp_context,
         temperature=rollout_temperature,
         metadata={
             "logits_are_temperature_scaled": True,
@@ -597,10 +584,10 @@ def get_log_probs_and_entropy(
             "tp_world_size": mpu.get_tensor_model_parallel_world_size(),
         },
     )
-    # The provider owns only selected-logprob math and its TP reduction. Vime
+    # The provider owns linear_logp math and its TP reduction. Vime
     # retains target construction, CP layout ownership, response extraction,
     # CP redistribution, and loss composition.
-    log_prob_full, entropy_full = compute_selected_logprobs(
+    log_prob_full, entropy_full = compute_linear_logp(
         args=args,
         request=request,
         native=calculate_log_probs_and_entropy,
@@ -954,7 +941,7 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
-    linear_logp_context: Mapping[str, Any] | None = None,
+    linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO) and metrics.
 
@@ -1204,7 +1191,7 @@ def value_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
-    linear_logp_context: Mapping[str, Any] | None = None,
+    linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute clipped value loss and metrics.
 
@@ -1262,7 +1249,7 @@ def sft_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
-    linear_logp_context: Mapping[str, Any] | None = None,
+    linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute supervised fine-tuning loss over response tokens.
 
@@ -1315,7 +1302,7 @@ def loss_function(
     num_microbatches: int,
     step_global_batch_size: int,
     logits: torch.Tensor,
-    linear_logp_context: Mapping[str, Any] | None = None,
+    linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
