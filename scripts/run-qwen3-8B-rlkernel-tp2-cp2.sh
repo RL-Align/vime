@@ -86,8 +86,8 @@ ROLLOUT_GPUS_PER_ENGINE="${ROLLOUT_GPUS_PER_ENGINE:-2}"
 ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
 COLOCATE="${COLOCATE:-0}"
 
-if [[ "${NUM_GPUS}" != "8" || "${ACTOR_GPUS}" != "4" || "${ROLLOUT_GPUS}" != "4" ]]; then
-  echo "This validation entry point requires an 8-GPU node with 4 actor GPUs and 4 rollout GPUs" >&2
+if [[ "${NUM_GPUS}" != "8" ]]; then
+  echo "This validation entry point requires an 8-GPU node" >&2
   exit 2
 fi
 if [[ "${COLOCATE}" != "0" && "${COLOCATE}" != "1" ]]; then
@@ -95,8 +95,25 @@ if [[ "${COLOCATE}" != "0" && "${COLOCATE}" != "1" ]]; then
   exit 2
 fi
 
-if [[ "${TP_SIZE}" != "2" || "${CP_SIZE}" != "2" ]]; then
-  echo "This validation entry point is intentionally fixed to TP=2, CP=2" >&2
+if [[ "$((TP_SIZE * CP_SIZE))" != "${ACTOR_GPUS}" ]]; then
+  echo "TP_SIZE * CP_SIZE must equal ACTOR_GPUS" >&2
+  exit 2
+fi
+if [[ "${COLOCATE}" == "1" ]]; then
+  if [[ "${ACTOR_GPUS}" != "8" || "${ROLLOUT_GPUS}" != "8" ]]; then
+    echo "Colocated execution requires 8 actor GPUs and 8 logical rollout GPUs" >&2
+    exit 2
+  fi
+elif [[ "${ACTOR_GPUS}" != "4" || "${ROLLOUT_GPUS}" != "4" ]]; then
+  echo "Disjoint execution requires 4 actor GPUs and 4 rollout GPUs" >&2
+  exit 2
+fi
+if [[ "${ROLLOUT_GPUS_PER_ENGINE}" != "${TP_SIZE}" ]]; then
+  echo "ROLLOUT_GPUS_PER_ENGINE must equal TP_SIZE for aligned logp validation" >&2
+  exit 2
+fi
+if (( ROLLOUT_GPUS % ROLLOUT_GPUS_PER_ENGINE != 0 )); then
+  echo "ROLLOUT_GPUS must be divisible by ROLLOUT_GPUS_PER_ENGINE" >&2
   exit 2
 fi
 if [[ "${RL_KERNEL_MODE}" != off \
@@ -110,7 +127,7 @@ source "${VIME_ROOT}/scripts/models/qwen3-8B.sh"
 
 MODEL_ROOT="${MODEL_ROOT:-/root/Qwen3-8B}"
 TORCH_DIST_ROOT="${TORCH_DIST_ROOT:-/root/Qwen3-8B_torch_dist}"
-VIME_CKPT="${VIME_CKPT:-/root/Qwen3-8B_vime_rlkernel_tp2_cp2}"
+VIME_CKPT="${VIME_CKPT:-/root/Qwen3-8B_vime_rlkernel_tp${TP_SIZE}_cp${CP_SIZE}}"
 PROMPT_DATA="${PROMPT_DATA:-/root/dapo-math-17k/dapo-math-17k.jsonl}"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
