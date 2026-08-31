@@ -248,6 +248,26 @@ def test_compute_server_args_external_check_fields_skip_orchestration_fields(vll
 
 
 @pytest.mark.unit
+def test_compute_server_args_colocate_tensor_uses_ipc_weight_backend(vllm_args):
+    vllm_args.colocate = True
+    vllm_args.update_weight_transport = "tensor"
+    sa, _ = mod._compute_server_args(
+        vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000
+    )
+    assert sa["weight_transfer_config"] == {"backend": "ipc"}
+
+
+@pytest.mark.unit
+def test_compute_server_args_colocate_disk_uses_nccl_weight_backend(vllm_args):
+    vllm_args.colocate = True
+    vllm_args.update_weight_transport = "disk"
+    sa, _ = mod._compute_server_args(
+        vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000
+    )
+    assert sa["weight_transfer_config"] == {"backend": "nccl"}
+
+
+@pytest.mark.unit
 def test_build_vllm_subprocess_env_colocate(vllm_args, monkeypatch):
     vllm_args.colocate = True
     monkeypatch.delenv("PYTHONPATH", raising=False)
