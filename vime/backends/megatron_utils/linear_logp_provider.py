@@ -17,6 +17,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 _LOGGED_PROVIDER_IDENTITIES: set[tuple[str, str]] = set()
+_LOGGED_NATIVE_IDENTITIES: set[tuple[str, str, str]] = set()
+_NATIVE_CONTRACT_ID = "vime.native.linear_logp.v1"
 
 ProviderMode = Literal["auto", "strict"]
 TokenLayoutKind = Literal["single", "zigzag", "allgather"]
@@ -202,7 +204,7 @@ def compute_linear_logp(
 
     path = linear_logp_provider_path(args)
     if path is None:
-        return _native(request, native)
+        return _native(request, native, route="unconfigured")
 
     mode = linear_logp_provider_mode(args)
     try:
@@ -211,7 +213,7 @@ def compute_linear_logp(
         if mode == "strict":
             raise RuntimeError(f"linear_logp provider {path!r} is unavailable: {exc}") from exc
         logger.warning("linear_logp provider %s is unavailable; using native path: %s", path, exc)
-        return _native(request, native)
+        return _native(request, native, route="provider_unavailable_fallback")
     try:
         result = provider(request)
     except Exception as exc:
@@ -220,7 +222,7 @@ def compute_linear_logp(
         if mode == "strict":
             raise RuntimeError(f"linear_logp provider {path!r} is unavailable: {exc}") from exc
         logger.warning("linear_logp provider %s is unavailable; using native path: %s", path, exc)
-        return _native(request, native)
+        return _native(request, native, route="provider_unavailable_fallback")
 
     normalized = _normalize_result(result)
     _validate_result(normalized, request, strict=mode == "strict")
@@ -241,8 +243,10 @@ def _load_provider(path: str) -> LinearLogpProvider:
 def _native(
     request: LinearLogpRequest,
     native: Callable[..., tuple[torch.Tensor, torch.Tensor | None]],
+    *,
+    route: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    return native(
+    result = native(
         request.logits,
         request.target_ids,
         request.tensor_parallel_group,
@@ -250,6 +254,27 @@ def _native(
         with_entropy_grad=request.with_entropy_grad,
         chunk_size=request.chunk_size,
         log_prob_keep_mask=request.log_prob_keep_mask,
+    )
+    _log_native_identity(native, route=route, device_type=request.logits.device.type)
+    return result
+
+
+def _log_native_identity(
+    native: Callable[..., Any], *, route: str, device_type: str
+) -> None:
+    module = getattr(native, "__module__", type(native).__module__)
+    qualname = getattr(native, "__qualname__", type(native).__qualname__)
+    backend_id = f"{module}.{qualname}"
+    identity = (backend_id, route, device_type)
+    if identity in _LOGGED_NATIVE_IDENTITIES:
+        return
+    _LOGGED_NATIVE_IDENTITIES.add(identity)
+    logger.info(
+        "linear_logp native active: backend_id=%s contract_id=%s route=%s device=%s",
+        backend_id,
+        _NATIVE_CONTRACT_ID,
+        route,
+        device_type,
     )
 
 

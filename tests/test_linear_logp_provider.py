@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vime.backends.megatron_utils.linear_logp_provider as provider_module
 from vime.backends.megatron_utils.linear_logp_provider import (
     LinearLogpContext,
     LinearLogpProviderUnavailable,
@@ -74,12 +76,19 @@ def _args(path=None, mode="auto"):
     return SimpleNamespace(linear_logp_provider=path, linear_logp_provider_mode=mode)
 
 
-def test_unconfigured_provider_uses_native_path():
+def test_unconfigured_provider_uses_native_path_and_reports_actual_backend(caplog):
     request = _request()
-    actual, entropy = compute_linear_logp(args=_args(), request=request, native=_native)
+    provider_module._LOGGED_NATIVE_IDENTITIES.clear()
+    with caplog.at_level(logging.INFO, logger=provider_module.__name__):
+        actual, entropy = compute_linear_logp(args=_args(), request=request, native=_native)
 
     assert entropy is None
     torch.testing.assert_close(actual, request.logits[:, :1])
+    assert "linear_logp native active:" in caplog.text
+    assert f"backend_id={__name__}._native" in caplog.text
+    assert "contract_id=vime.native.linear_logp.v1" in caplog.text
+    assert "route=unconfigured" in caplog.text
+    assert "device=cpu" in caplog.text
 
 
 def test_provider_receives_structured_request_and_returns_result(monkeypatch):
@@ -154,9 +163,10 @@ def test_provider_may_return_a_structural_result_from_an_external_package(monkey
     torch.testing.assert_close(actual, request.logits[:, :1])
 
 
-def test_auto_mode_only_falls_back_for_explicit_unavailability(monkeypatch):
+def test_auto_mode_only_falls_back_for_explicit_unavailability(monkeypatch, caplog):
     request = _request()
     calls = {"native": 0}
+    provider_module._LOGGED_NATIVE_IDENTITIES.clear()
 
     def provider(_request):
         raise LinearLogpProviderUnavailable("unsupported topology")
@@ -166,11 +176,13 @@ def test_auto_mode_only_falls_back_for_explicit_unavailability(monkeypatch):
         return _native(*args, **kwargs)
 
     path = _install_provider(monkeypatch, provider)
-    actual, entropy = compute_linear_logp(args=_args(path), request=request, native=native)
+    with caplog.at_level(logging.INFO, logger=provider_module.__name__):
+        actual, entropy = compute_linear_logp(args=_args(path), request=request, native=native)
 
     assert calls["native"] == 1
     assert entropy is None
     torch.testing.assert_close(actual, request.logits[:, :1])
+    assert "route=provider_unavailable_fallback" in caplog.text
 
 
 def test_strict_mode_rejects_unavailable_provider(monkeypatch):
