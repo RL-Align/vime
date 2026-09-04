@@ -91,6 +91,8 @@ class LinearLogpContext:
     hidden: torch.Tensor
     projection: LinearProjection
     vocab_partition: VocabPartition
+    reuse_local_logits: bool = False
+    local_logits: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.hidden, torch.Tensor) or self.hidden.ndim != 2:
@@ -101,6 +103,17 @@ class LinearLogpContext:
             raise ValueError("linear_logp projection width must match vocabulary partition")
         if self.hidden.device != self.projection.weight.device:
             raise ValueError("linear_logp context tensors must share a device")
+        if not isinstance(self.reuse_local_logits, bool):
+            raise TypeError("linear_logp reuse_local_logits must be a bool")
+        if self.local_logits is not None:
+            if self.local_logits.ndim != 2:
+                raise ValueError("linear_logp context.local_logits must be [T, V_local]")
+            if self.local_logits.size(0) != self.hidden.size(0):
+                raise ValueError("linear_logp context local-logits rows must match hidden rows")
+            if self.local_logits.size(1) != self.vocab_partition.local_size:
+                raise ValueError("linear_logp context local-logits width must match vocabulary shard")
+            if self.local_logits.device != self.hidden.device:
+                raise ValueError("linear_logp context local logits must share the hidden device")
 
 
 @dataclass(frozen=True)

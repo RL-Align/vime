@@ -105,6 +105,9 @@ def _install_linear_logp_capture(model_chunks: Sequence[DDP], args: Namespace) -
                     real_size=real_vocab,
                     padded_size=global_vocab,
                 ),
+                reuse_local_logits=bool(
+                    getattr(module, "__rl_kernel_reusable_local_logits__", False)
+                ),
             )
 
         handle = output_layer.register_forward_pre_hook(capture, with_kwargs=True)
@@ -115,6 +118,22 @@ def _take_linear_logp_context(model_chunk):
     owner = _unwrap_model_chunk(model_chunk)
     context = getattr(owner, "_vime_linear_logp_context", None)
     owner._vime_linear_logp_context = None
+    output_layer = getattr(owner, "output_layer", None)
+    local_logits = getattr(output_layer, "_rl_kernel_local_logits", None)
+    if output_layer is not None:
+        output_layer._rl_kernel_local_logits = None
+    if context is not None and context.reuse_local_logits:
+        if not isinstance(local_logits, torch.Tensor):
+            raise RuntimeError("strict reusable LM head did not publish local logits")
+        if local_logits.ndim == 3:
+            local_logits = local_logits.transpose(0, 1).contiguous().reshape(
+                -1, local_logits.size(-1)
+            )
+        elif local_logits.ndim != 2:
+            raise RuntimeError(
+                f"unsupported strict reusable LM-head logits shape: {tuple(local_logits.shape)}"
+            )
+        context = dataclasses.replace(context, local_logits=local_logits)
     return context
 
 
