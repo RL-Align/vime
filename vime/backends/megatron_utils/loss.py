@@ -30,6 +30,7 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
+from .linear_logp_provider import LinearLogpContext, LinearLogpRequest, TokenLayout, compute_linear_logp
 
 ROLLOUT_TOP_P_TOKEN_KEYS = (
     "rollout_top_p_token_ids",
@@ -521,6 +522,7 @@ def get_log_probs_and_entropy(
     non_loss_data: bool = True,
     top_p_token_ids: list[list[int]] | None = None,
     top_p_token_offsets: list[list[int]] | None = None,
+    linear_logp_context: LinearLogpContext | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
@@ -532,15 +534,13 @@ def get_log_probs_and_entropy(
     log-probabilities; entropy is always computed from the unmasked logits.
     """
     assert non_loss_data
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    if logits.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise TypeError(f"linear_logp logits must be floating point, got {logits.dtype}")
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
 
-    # Apply rollout temperature scaling to logits to match rollout-time log-probs.
     rollout_temperature = getattr(args, "rollout_temperature", 1.0)
-    if rollout_temperature != 1.0:
-        logits = logits / rollout_temperature
     logits = logits.contiguous()
     T = logits.size(0)
     device = logits.device
@@ -567,15 +567,39 @@ def get_log_probs_and_entropy(
             args.allgather_cp,
         )
 
-    # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
-    log_prob_full, entropy_full = calculate_log_probs_and_entropy(
-        logits,
-        full_tokens,
-        tp_group,
+    cp_world_size = mpu.get_context_parallel_world_size()
+    request = LinearLogpRequest(
+        logits=logits,
+        target_ids=full_tokens,
+        tensor_parallel_group=tp_group,
+        token_layout=TokenLayout(
+            world_size=cp_world_size,
+            rank=mpu.get_context_parallel_rank(),
+            layout="single" if cp_world_size == 1 else "allgather" if args.allgather_cp else "zigzag",
+        ),
         with_entropy=with_entropy,
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        context=linear_logp_context,
+        temperature=rollout_temperature,
+        metadata={
+            "real_vocab_size": getattr(args, "vocab_size", None),
+            "padded_vocab_size": getattr(args, "padded_vocab_size", None),
+            "tp_rank": mpu.get_tensor_model_parallel_rank(),
+            "tp_world_size": mpu.get_tensor_model_parallel_world_size(),
+        },
+    )
+
+    def native_linear_logp(native_logits, *native_args, **native_kwargs):
+        if rollout_temperature != 1.0:
+            native_logits = native_logits / rollout_temperature
+        return calculate_log_probs_and_entropy(native_logits, *native_args, **native_kwargs)
+
+    log_prob_full, entropy_full = compute_linear_logp(
+        args=args,
+        request=request,
+        native=native_linear_logp,
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
@@ -935,6 +959,7 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO) and metrics.
 
@@ -973,6 +998,7 @@ def policy_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=True,
+        linear_logp_context=linear_logp_context,
         **get_rollout_top_p_logprob_kwargs(args, batch),
     )
 
@@ -1234,6 +1260,7 @@ def sft_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute supervised fine-tuning loss over response tokens.
 
@@ -1261,6 +1288,7 @@ def sft_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=False,
+        linear_logp_context=linear_logp_context,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1285,6 +1313,7 @@ def loss_function(
     num_microbatches: int,
     step_global_batch_size: int,
     logits: torch.Tensor,
+    linear_logp_context: LinearLogpContext | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -1335,10 +1364,21 @@ def loss_function(
         case _:
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
+    provider_kwargs = (
+        {"linear_logp_context": linear_logp_context} if args.loss_type in {"policy_loss", "sft_loss"} else {}
+    )
     if args.recompute_loss_function:
-        loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean, use_reentrant=False)
+        loss, log = checkpoint(
+            func,
+            args,
+            batch,
+            logits,
+            sum_of_sample_mean,
+            **provider_kwargs,
+            use_reentrant=False,
+        )
     else:
-        loss, log = func(args, batch, logits, sum_of_sample_mean)
+        loss, log = func(args, batch, logits, sum_of_sample_mean, **provider_kwargs)
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding). Without this, gradient doesn't flow through their attention path, so

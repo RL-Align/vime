@@ -3,10 +3,14 @@ from argparse import Namespace
 import _cp_dist_helpers  # noqa: F401
 import pytest
 import torch
-
 from megatron.core import mpu
-from vime.backends.megatron_utils.loss import _build_topp_keep_mask, get_rollout_top_p_logprob_kwargs
 
+from vime.backends.megatron_utils import loss as loss_module
+from vime.backends.megatron_utils.loss import (
+    _build_topp_keep_mask,
+    get_log_probs_and_entropy,
+    get_rollout_top_p_logprob_kwargs,
+)
 
 NUM_GPUS = 0
 
@@ -93,6 +97,53 @@ def test_top_p_mask_aligns_with_cp1_response_rows(monkeypatch):
 
     masked_rows = {row: _kept_ids(keep[row]) for row in range(keep.size(0)) if not keep[row].all()}
     assert masked_rows == {2: [13], 3: [14], 5: [21], 6: [22], 7: [23]}
+
+
+@pytest.mark.unit
+def test_provider_receives_unscaled_logits_and_native_fallback_scales_once(monkeypatch):
+    _set_cp(monkeypatch, size=1, rank=0)
+    monkeypatch.setattr(mpu, "get_tensor_model_parallel_group", lambda: None, raising=False)
+    monkeypatch.setattr(mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    observed = {}
+
+    def calculate(logits, *_args, with_entropy, **_kwargs):
+        observed["native_logits"] = logits.clone()
+        return logits[:, :1], logits.sum(dim=-1) if with_entropy else None
+
+    def dispatch(*, request, native, **_kwargs):
+        observed["request_logits"] = request.logits.clone()
+        observed["temperature"] = request.temperature
+        return native(
+            request.logits,
+            request.target_ids,
+            request.tensor_parallel_group,
+            with_entropy=request.with_entropy,
+            with_entropy_grad=request.with_entropy_grad,
+            chunk_size=request.chunk_size,
+            log_prob_keep_mask=request.log_prob_keep_mask,
+        )
+
+    monkeypatch.setattr(loss_module, "calculate_log_probs_and_entropy", calculate)
+    monkeypatch.setattr(loss_module, "compute_linear_logp", dispatch)
+    logits = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+    args = Namespace(
+        allgather_cp=False,
+        entropy_coef=0.0,
+        log_probs_chunk_size=-1,
+        rollout_temperature=0.5,
+    )
+
+    get_log_probs_and_entropy(
+        logits,
+        args=args,
+        unconcat_tokens=[torch.tensor([0, 1, 2])],
+        total_lengths=[3],
+        response_lengths=[2],
+    )
+
+    torch.testing.assert_close(observed["request_logits"], logits.squeeze(0))
+    torch.testing.assert_close(observed["native_logits"], logits.squeeze(0) / 0.5)
+    assert observed["temperature"] == 0.5
 
 
 if __name__ == "__main__":

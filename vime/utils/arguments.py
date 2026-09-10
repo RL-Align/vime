@@ -264,6 +264,18 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--linear-logp-provider",
+                type=str,
+                default=None,
+                help="Fully qualified callable that replaces Megatron linear-logp computation.",
+            )
+            parser.add_argument(
+                "--linear-logp-provider-mode",
+                choices=("auto", "strict"),
+                default="auto",
+                help="Fall back when the provider is unavailable, or fail closed in strict mode.",
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",

@@ -28,16 +28,79 @@ try:
     from megatron.core.pipeline_parallel.utils import unwrap_model
 except ImportError:
     from megatron.core.utils import unwrap_model
+
 from vime.observability import logging_utils, train_metric_utils
 from vime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
+from .linear_logp_provider import LinearLogpContext, LinearProjection, VocabPartition, linear_logp_provider_path
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
 from .stateless_adam import StatelessAdam
 
 logger = logging.getLogger(__name__)
+
+
+def _unwrap_model_chunk(model_chunk):
+    while hasattr(model_chunk, "module"):
+        model_chunk = model_chunk.module
+    return model_chunk
+
+
+def _install_linear_logp_capture(model_chunks: Sequence[DDP], args: Namespace) -> None:
+    from megatron.core.tensor_parallel.utils import VocabUtility
+
+    for model_chunk in model_chunks:
+        owner = _unwrap_model_chunk(model_chunk)
+        output_layer = getattr(owner, "output_layer", None)
+        if output_layer is None or hasattr(output_layer, "_vime_linear_logp_capture_handle"):
+            continue
+        if not hasattr(output_layer, "output_size_per_partition") or not hasattr(output_layer, "tp_group"):
+            continue
+
+        def capture(module, inputs, kwargs, *, context_owner=owner):
+            hidden = inputs[0] if inputs else kwargs.get("input_")
+            weight = inputs[1] if len(inputs) > 1 else kwargs.get("weight")
+            if weight is None:
+                weight = getattr(module, "weight", None)
+            if not isinstance(hidden, torch.Tensor) or not isinstance(weight, torch.Tensor):
+                raise RuntimeError("Megatron output layer did not expose hidden states and weight")
+            if hidden.ndim == 3:
+                hidden = hidden.transpose(0, 1).contiguous().reshape(-1, hidden.size(-1))
+            elif hidden.ndim != 2:
+                raise RuntimeError(f"unsupported Megatron output-layer input shape: {tuple(hidden.shape)}")
+
+            tp_world_size = mpu.get_tensor_model_parallel_world_size()
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            padded_vocab_size = int(getattr(args, "padded_vocab_size", weight.size(0) * tp_world_size))
+            real_vocab_size = int(getattr(args, "vocab_size", padded_vocab_size))
+            if weight.size(0) * tp_world_size != padded_vocab_size:
+                raise RuntimeError("linear_logp provider requires equal contiguous TP vocabulary shards")
+            vocab_start, _ = VocabUtility.vocab_range_from_per_partition_vocab_size(
+                weight.size(0), tp_rank, tp_world_size
+            )
+            context_owner._vime_linear_logp_context = LinearLogpContext(
+                hidden=hidden,
+                projection=LinearProjection(weight=weight, bias=getattr(module, "bias", None)),
+                vocab_partition=VocabPartition(
+                    local_start=int(vocab_start),
+                    local_size=weight.size(0),
+                    real_size=real_vocab_size,
+                    padded_size=padded_vocab_size,
+                ),
+            )
+
+        output_layer._vime_linear_logp_capture_handle = output_layer.register_forward_pre_hook(
+            capture, with_kwargs=True
+        )
+
+
+def _take_linear_logp_context(model_chunk):
+    owner = _unwrap_model_chunk(model_chunk)
+    context = getattr(owner, "_vime_linear_logp_context", None)
+    owner._vime_linear_logp_context = None
+    return context
 
 
 def _disable_tqdm_for_non_main_rank() -> bool:
@@ -291,6 +354,8 @@ def setup_model_and_optimizer(
     assert args.load is not None or args.pretrained_checkpoint is not None
 
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
+    if role == "actor" and linear_logp_provider_path(args) is not None:
+        _install_linear_logp_capture(model, args)
 
     if args.num_rollout == 0:
         args.no_load_optim = True
@@ -434,6 +499,7 @@ def forward_only(
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
         output_tensor = model(**forward_kwargs)
+        linear_logp_context = _take_linear_logp_context(model)
 
         output_kwargs = {
             "args": args,
@@ -441,6 +507,7 @@ def forward_only(
             "total_lengths": total_lengths,
             "response_lengths": response_lengths,
             "with_entropy": args.use_rollout_entropy,
+            "linear_logp_context": linear_logp_context,
         }
         if use_rollout_top_p_replay:
             output_kwargs.update(get_rollout_top_p_logprob_kwargs(args, batch))
@@ -665,6 +732,8 @@ def train_one_step(
             else:
                 output_tensor = model(**forward_kwargs)
 
+        linear_logp_context = _take_linear_logp_context(model)
+
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
@@ -680,7 +749,14 @@ def train_one_step(
                 dspark_outputs,
                 dspark_config,
             )
-        return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
+        return output_tensor, partial(
+            loss_function,
+            args,
+            batch,
+            num_microbatches,
+            step_global_batch_size,
+            linear_logp_context=linear_logp_context,
+        )
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()

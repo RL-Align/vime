@@ -169,6 +169,37 @@ def test_allgather_cp_ignores_cp_size_one(monkeypatch):
 
 
 @pytest.mark.unit
+def test_strict_linear_logp_provider_requires_provider_path(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(linear_logp_provider=None, linear_logp_provider_mode="strict")
+
+    with pytest.raises(ValueError, match="requires --linear-logp-provider"):
+        module._validate_linear_logp_provider_args(args)
+
+
+@pytest.mark.unit
+def test_linear_logp_provider_arguments_are_registered(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    module.RouterArgs = types.SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    module.get_vime_extra_args_provider()(parser)
+
+    args = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--linear-logp-provider",
+            "package.module.provider",
+            "--linear-logp-provider-mode",
+            "strict",
+        ]
+    )
+
+    assert args.linear_logp_provider == "package.module.provider"
+    assert args.linear_logp_provider_mode == "strict"
+
+
+@pytest.mark.unit
 def test_update_weight_disk_dir_required_for_disk_transport(monkeypatch):
     module = load_vime_arguments_module(monkeypatch)
     args = make_vime_validate_args(update_weight_transport="disk", update_weight_disk_dir=None)
