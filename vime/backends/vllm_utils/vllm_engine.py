@@ -93,7 +93,11 @@ def _run_vllm_server(kwargs: dict, env: dict) -> None:
     os.environ.update(env)
 
     from vllm.entrypoints.cli.serve import ServeSubcommand
-    from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
+
+    try:
+        from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
+    except ImportError:
+        from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     ns = argparse.Namespace(**kwargs)
@@ -747,7 +751,15 @@ def _compute_server_args(
 def _vllm_server_field_names() -> frozenset[str]:
     """Return the vLLM fields accepted by CLI generation and config overrides."""
     from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.entrypoints.launchers.cli_args import FrontendArgs
+
+    try:
+        from vllm.entrypoints.launchers.cli_args import FrontendArgs
+    except ImportError:
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+        parser = make_arg_parser(FlexibleArgumentParser(add_help=False))
+        return frozenset(action.dest for action in parser._actions if action.dest != argparse.SUPPRESS)
 
     return frozenset(f.name for f in (*dataclasses.fields(AsyncEngineArgs), *dataclasses.fields(FrontendArgs)))
 
