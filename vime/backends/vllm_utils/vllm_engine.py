@@ -68,7 +68,7 @@ def _build_subprocess_env(server_args_dict: dict[str, Any]) -> dict[str, str]:
     # ROCm: keep HIP visibility in sync with CUDA (no-op on CUDA).
     env["HIP_VISIBLE_DEVICES"] = server_args_dict["_visible_devices"]
     env.setdefault("VLLM_SERVER_DEV_MODE", "1")
-    env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    env["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     if getattr(args, "vllm_enable_deterministic_inference", False):
         env["VLLM_BATCH_INVARIANT"] = "1"
     if getattr(args, "colocate", False):
@@ -325,21 +325,14 @@ class VLLMEngine(RayActor):
     def get_weight_version(self):
         if self.node_rank != 0:
             return
-        response = requests.get(f"http://{self.server_host}:{self.server_port}/weight_info")
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as error:
-            error.add_note(f"{response.text=}")
-            raise
-        weight_version = response.json()["weight_version"]
-        self._weight_version = None if weight_version is None else str(weight_version)
+        if self._weight_version is None:
+            raise RuntimeError(
+                "VLLMEngine.get_weight_version called before any successful " "weight transfer recorded a version."
+            )
         return self._weight_version
 
     def set_weight_version(self, new_version: str):
-        version = str(new_version)
-        result = self._make_request("update_weight_version", {"new_version": version})
-        self._weight_version = version
-        return result
+        self._weight_version = str(new_version)
 
     def release_memory_occupation(self, level: int = 2):
         self.flush_cache()
@@ -690,7 +683,7 @@ def _compute_server_args(
     ):
         kwargs["max_model_len"] = args.rollout_max_context_len
 
-    if args.colocate:
+    if args.colocate and getattr(args, "update_weight_transport", None) != "disk":
         kwargs["weight_transfer_config"] = {"backend": "ipc"}
     else:
         kwargs["weight_transfer_config"] = {"backend": "nccl"}

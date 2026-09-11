@@ -278,6 +278,22 @@ def test_compute_server_args_external_check_fields_skip_orchestration_fields(vll
 
 
 @pytest.mark.unit
+def test_compute_server_args_colocate_tensor_uses_ipc_weight_backend(vllm_args):
+    vllm_args.colocate = True
+    vllm_args.update_weight_transport = "tensor"
+    sa, _ = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
+    assert sa["weight_transfer_config"] == {"backend": "ipc"}
+
+
+@pytest.mark.unit
+def test_compute_server_args_colocate_disk_uses_nccl_weight_backend(vllm_args):
+    vllm_args.colocate = True
+    vllm_args.update_weight_transport = "disk"
+    sa, _ = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
+    assert sa["weight_transfer_config"] == {"backend": "nccl"}
+
+
+@pytest.mark.unit
 def test_build_vllm_subprocess_env_colocate(vllm_args, monkeypatch):
     vllm_args.colocate = True
     monkeypatch.delenv("PYTHONPATH", raising=False)
@@ -312,9 +328,9 @@ def test_build_vllm_subprocess_env_sets_batch_invariant_when_deterministic(vllm_
 
 
 @pytest.mark.unit
-def test_build_vllm_subprocess_env_enables_v2_runner_by_default(vllm_args):
+def test_build_vllm_subprocess_env_uses_reload_compatible_runner(vllm_args):
     env = mod._build_subprocess_env({"_args": vllm_args, "_visible_devices": "0"})
-    assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
 
 
 @pytest.mark.unit
@@ -516,41 +532,26 @@ def test_update_weights_does_not_advance_version_on_failure(vllm_engine, monkeyp
 
 
 @pytest.mark.unit
-def test_get_weight_version_reads_vllm_weight_info(vllm_engine, monkeypatch):
-    monkeypatch.setattr(
-        mod.requests,
-        "get",
-        lambda *args, **kwargs: _MockResponse(json_data={"weight_version": "7"}),
-    )
-
+def test_get_weight_version_returns_recorded_version(vllm_engine):
+    vllm_engine._weight_version = "7"
     assert vllm_engine.get_weight_version() == "7"
-    assert vllm_engine._weight_version == "7"
 
 
 @pytest.mark.unit
-def test_get_weight_version_preserves_uninitialized_none(vllm_engine, monkeypatch):
-    monkeypatch.setattr(
-        mod.requests,
-        "get",
-        lambda *args, **kwargs: _MockResponse(json_data={"weight_version": None}),
-    )
-
-    assert vllm_engine.get_weight_version() is None
-    assert vllm_engine._weight_version is None
+def test_get_weight_version_raises_when_unset(vllm_engine):
+    with pytest.raises(RuntimeError, match="before any successful weight transfer"):
+        vllm_engine.get_weight_version()
 
 
 @pytest.mark.unit
 def test_set_weight_version_updates_vllm_and_local_cache(vllm_engine, monkeypatch):
-    calls: list[tuple] = []
+    monkeypatch.setattr(
+        vllm_engine,
+        "_make_request",
+        lambda *_args, **_kwargs: pytest.fail("unexpected HTTP request"),
+    )
 
-    def fake_post(endpoint: str, payload: dict):
-        calls.append((endpoint, payload))
-        return {"success": True}
-
-    monkeypatch.setattr(vllm_engine, "_make_request", fake_post)
-
-    assert vllm_engine.set_weight_version("9") == {"success": True}
-    assert calls == [("update_weight_version", {"new_version": "9"})]
+    assert vllm_engine.set_weight_version("9") is None
     assert vllm_engine._weight_version == "9"
 
 
@@ -774,8 +775,6 @@ def test_update_weights_from_disk_posts_collective_rpc(vllm_engine, monkeypatch)
     assert vllm_engine.update_weights_from_disk("/tmp/model", weight_version="8") == {"reloaded": True}
     assert seen[0][0] == "http://127.0.0.1:8765/collective_rpc"
     assert seen[0][3]["method"] == "reload_weights"
-    assert seen[1][0] == "http://127.0.0.1:8765/update_weight_version"
-    assert seen[1][3] == {"new_version": "8"}
     assert vllm_engine._weight_version == "8"
 
 
@@ -805,10 +804,6 @@ def test_pull_weights_posts_collective_rpc(vllm_engine, monkeypatch):
                     "pre_read_hook": "hooks.refresh",
                 },
             },
-        ),
-        (
-            "http://127.0.0.1:8765/update_weight_version",
-            {"new_version": "8"},
         ),
     ]
     assert vllm_engine._weight_version == "8"
