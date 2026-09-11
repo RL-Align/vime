@@ -73,10 +73,18 @@ def _is_moe_config(hf_config):
     )
 
 
+def _validate_linear_logp_provider_args(args):
+    provider = str(getattr(args, "linear_logp_provider", "") or "").strip()
+    mode = str(getattr(args, "linear_logp_provider_mode", "auto")).strip().lower()
+    if mode == "strict" and not provider:
+        raise ValueError("--linear-logp-provider-mode strict requires --linear-logp-provider")
+
+
 def validate_args(args):
     """Run megatron's own validate_args plus vime-specific megatron validations."""
 
     _megatron_validate_args(args)
+    _validate_linear_logp_provider_args(args)
 
     # always use varlen
     args.variable_seq_lengths = True
